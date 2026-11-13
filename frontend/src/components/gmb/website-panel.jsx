@@ -38,7 +38,7 @@ export function WebsitePanel({ clientId }) {
           <Link href={`/gmb/${clientId}/website/new`}><Button><Sparkles className="h-4 w-4" /> Create from Google</Button></Link>
         </> : null} />
       <div className="space-y-3 p-4 sm:p-5">
-        {error ? <Alert>{error}</Alert> : null}
+             {error ? <Alert>{error}</Alert> : data?.unavailable ? <Alert>{data.error}</Alert> : null}
         {msg ? <Alert tone={msg.tone}>{msg.text}</Alert> : null}
         {loading && !data ? <Skeleton className="h-28" /> : !data?.configured ? (
           <Alert tone="amber">The website builder isn&apos;t connected yet. Super admin: Admin → Integrations → Website Builder (API URL, panel URL, integration key).</Alert>

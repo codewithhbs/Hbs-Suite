@@ -16,10 +16,15 @@ export const GET = route({ permission: "gmb.view" }, async ({ ctx, params }) => 
   await assertClientInTenant(id, ctx.tenantId);
   const cfg = await wbConfig();
   if (!cfg.configured) return { configured: false, websites: [] };
-  const r = await syncBuilderClient(id, ctx.tenantId);
-  return { configured: true, builderClientId: r.builderClientId, websites: r.websites };
+  try {
+    const r = await syncBuilderClient(id, ctx.tenantId);
+    return { configured: true, builderClientId: r.builderClientId, websites: r.websites };
+  } catch (e) {
+    if (e.status === 404) throw e;
+    console.warn("[website-builder]", e.message);
+    return { configured: true, unavailable: true, error: e.message, websites: [] };
+  }
 });
-
 /**
  * POST { action: "create" | "edit" | "publish" | "unpublish" | "delete", website_id? }
  * create/edit return { url } - the builder panel opened already signed in.

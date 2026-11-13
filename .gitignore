@@ -10,19 +10,21 @@ node_modules/
 service-account*.json
 
 # builds
-frontend/dist/
+/frontend/dist/
 dist/
 build/
 .vite/
 coverage/
 
-# runtime files (uploads, generated images, reports, support attachments)
-backend/storage/
-storage/
-uploads/
+# runtime files (uploads, generated images, reports) - only the top-level runtime folders
+/backend/storage/
+/backend/uploads/
+/storage/
+/uploads/
 
 # logs
-logs/
+/logs/
+/backend/logs/
 *.log
 npm-debug.log*
 yarn-debug.log*
@@ -35,9 +37,9 @@ pids/
 *.pid
 
 # database dumps / backups
+*.sql
 *.sql.gz
 *.dump
-backup*.sql
 backups/
 
 # OS / editor
@@ -54,4 +56,4 @@ desktop.ini
 *.zip
 .cache/
 .eslintcache
-tmp/
+/tmp/

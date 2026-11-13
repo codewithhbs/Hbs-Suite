@@ -21,12 +21,7 @@ module.exports = {
       exec_mode: "cluster",
       instances: Number(process.env.API_INSTANCES || 2),
       max_memory_restart: "1G",
-      env: {
-        NODE_ENV: "production",
-        TZ: "Asia/Kolkata",
-        PORT: 4000,
-        HOST: "127.0.0.1",
-      },
+      env: { NODE_ENV: "production", TZ: "Asia/Kolkata", PORT: 7349, HOST: "127.0.0.1" },
       out_file: "/var/log/hbs-suite/hbs-suite.out.log",
       error_file: "/var/log/hbs-suite/hbs-suite.err.log",
       time: true,

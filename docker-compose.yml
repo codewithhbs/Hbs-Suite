@@ -1,0 +1,18 @@
+# Local dev services only (MySQL 8 + Redis 7). The apps run with npm.
+services:
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: gmb_ai
+    command: ["--max_allowed_packet=64M", "--character-set-server=utf8mb4", "--collation-server=utf8mb4_unicode_ci"]
+    ports: ["3306:3306"]
+    volumes: ["mysql:/var/lib/mysql"]
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports: ["6379:6379"]
+    volumes: ["redis:/data"]
+volumes:
+  mysql:
+  redis:

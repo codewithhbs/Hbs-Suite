@@ -1,0 +1,88 @@
+import { cache } from "../../shims/react-cache.js";
+import { setScopeContext } from "./clientScope.js";
+import { getSession, requireSession } from "../auth.js";
+import { resolveEntitlements } from "./entitlements.js";
+import { can } from "./rbac.js";
+import { ROLES, effectivePermissions } from "./constants.js";
+import { one } from "../db.js";
+
+/**
+ * One object every server component / route handler uses.
+ * Super admin: tenantId = null (no row filter -> sees everything).
+ */
+// Short in-memory cache for the plan/usage/wallet snapshot, used ONLY by server-rendered pages.
+// API routes (guard.js -> getContext) always read fresh, so quota enforcement is never stale.
+const ENT_TTL_MS = 5000;
+const entCache = new Map(); // tenantId -> { at, promise }
+function entitlementsForPage(tenantId) {
+  const hit = entCache.get(tenantId);
+  if (hit && Date.now() - hit.at < ENT_TTL_MS) return hit.promise;
+  const promise = resolveEntitlements(tenantId);
+  entCache.set(tenantId, { at: Date.now(), promise });
+  promise.catch(() => entCache.delete(tenantId));
+  return promise;
+}
+
+async function buildContext(forPage) {
+  const t0 = Date.now();
+  const session = await getSession();
+  if (!session) return null;
+  // per-member permissions are read fresh every request, so owner changes apply immediately
+  const row = session.role === ROLES.SUPER_ADMIN || session.role === ROLES.OWNER ? null : await one("SELECT permissions FROM users WHERE id=?", [session.id]).catch(() => null);
+  const perms = effectivePermissions(session.role, row?.permissions ?? null);
+  const base = {
+    session,
+    perms,
+    userId: session.id,
+    name: session.name,
+    role: session.role,
+    tenantId: session.tenantId || null,
+    employeeId: session.employeeId || null,
+    isSuperAdmin: session.role === ROLES.SUPER_ADMIN,
+    impersonating: session.impersonatedBy || null,
+    can: (p) => can(session.role, p, perms),
+  };
+  if (!base.tenantId) {
+    const out = { ...base, ent: null };
+    setScopeContext(out);
+    return out;
+  }
+  const t1 = Date.now();
+  const ent = await (forPage ? entitlementsForPage(base.tenantId) : resolveEntitlements(base.tenantId));
+  // slow-request log: shows in `pm2 logs hbs-web` when the DB / CPU is the bottleneck
+  const total = Date.now() - t0;
+  if (total > 250) console.warn(`[slow-context] total=${total}ms entitlements=${Date.now() - t1}ms tenant=${base.tenantId}`);
+  const out = { ...base, ent, tenant: ent.tenant, plan: ent.plan, limits: ent.limits, features: ent.features };
+  setScopeContext(out);
+  return out;
+}
+
+/** Fresh read (API routes / quota checks), de-duplicated within one request. */
+export const getContext = cache(() => buildContext(false));
+/** Page render: plan snapshot may be up to 5s old. */
+export const getPageContext = cache(() => buildContext(true));
+
+export async function requireContext() {
+  await requireSession();
+  return getPageContext();
+}
+
+/** Tenant-scoped context for the workspace pages. */
+export async function requireTenantContext() {
+  const ctx = await requireContext();
+  if (!ctx.tenantId) {
+    const { redirect } = await import("../../shims/next-navigation.js");
+    redirect("/admin");
+  }
+  return ctx;
+}
+
+/** Workspace page guard: no permission -> back to the dashboard with a notice. */
+export async function requirePagePermission(permission) {
+  const ctx = await requireTenantContext();
+  if (!ctx.can(permission)) {
+    const { redirect } = await import("../../shims/next-navigation.js");
+    redirect(`/dashboard?denied=${encodeURIComponent(permission)}`);
+  }
+  return ctx;
+}

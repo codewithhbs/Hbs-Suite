@@ -1,0 +1,25 @@
+import { NextResponse } from "../../../shims/next-server.js";
+import { guard, apiError } from "../../../lib/saas/guard.js";
+import { assertClientInTenant } from "../../../lib/repo/clients.js";
+import { providerFor } from "../../../lib/gmb/provider.js";
+
+
+export async function GET(request, { params }) {
+  const g = await guard(request, { permission: "gmb.view" });
+  if (g.error) return g.error;
+
+  const { id, reviewId } = await params;
+  const clientId = Number(id);
+
+  try {
+    await assertClientInTenant(clientId, g.ctx.tenantId);
+    const provider = await providerFor(clientId);
+    const review = await provider.getReview(clientId, reviewId);
+    return NextResponse.json(
+      { ok: true, review },
+      { headers: { "Cache-Control": "no-store" } },
+    );
+  } catch (err) {
+    return apiError(err);
+  }
+}

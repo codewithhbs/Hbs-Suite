@@ -1,0 +1,123 @@
+import { BrandMark } from "@/components/brand";
+
+import Link from "next/link";
+import { useEffect } from "react";
+import { usePathname } from "next/navigation";
+import {
+  LayoutDashboard, Users, MapPin, CalendarDays, ListChecks,
+  KeyRound, Bot, BarChart3, Settings, X, CreditCard, UsersRound, Bell, FileText, LifeBuoy, Code2, Inbox, ShieldAlert, Radar,
+} from "lucide-react";
+import { cn } from "@/lib/utils";
+
+const NAV = [
+  { href: "/dashboard", label: "Dashboard", icon: LayoutDashboard },
+  { href: "/gmb/tasks", label: "Review queue", icon: ListChecks, perm: "task.view" },
+  { href: "/gmb/calendar", label: "Content calendar", icon: CalendarDays, perm: "calendar.view" },
+  { href: "/clients", label: "Clients", icon: Users, perm: "client.view" },
+  { href: "/gmb", label: "GMB profiles", icon: MapPin, perm: "gmb.view" },
+  { href: "/keywords", label: "Keywords", icon: KeyRound, perm: "keyword.view" },
+  { href: "/ai-runs", label: "AI runs", icon: Bot, perm: "task.view" },
+  { href: "/analytics", label: "Analytics", icon: BarChart3, perm: "analytics.view" },
+  { href: "/reviews", label: "Review inbox", icon: Inbox, perm: "gmb.view" },
+  { href: "/listing-health", label: "Listing health", icon: ShieldAlert, perm: "gmb.view" },
+  { href: "/rank-tracker", label: "Rank tracker", icon: Radar, perm: "gmb.view" },
+  { href: "/reports", label: "Shared reports", icon: FileText, perm: "analytics.view" },
+  { href: "/notifications", label: "Notifications", icon: Bell },
+  { href: "/support", label: "Support", icon: LifeBuoy },
+  { href: "/developers", label: "API & developers", icon: Code2, perm: "apikey.manage" },
+  { href: "/team", label: "Team", icon: UsersRound, perm: "team.view" },
+  { href: "/billing", label: "Billing & plan", icon: CreditCard, perm: "billing.view" },
+  { href: "/settings", label: "Settings", icon: Settings },
+];
+
+function NavList({ pathname, onNavigate, perms = [] }) {
+  return (
+    <nav className="flex-1 space-y-1 overflow-y-auto px-3 py-2">
+      {NAV.filter((n) => !n.perm || perms.includes(n.perm)).map(({ href, label, icon: Icon }) => {
+        const active = pathname === href || (href !== "/dashboard" && pathname.startsWith(href));
+        return (
+          <Link
+            key={href}
+            href={href}
+            prefetch={false}
+            onClick={onNavigate}
+            className={cn(
+              "flex items-center gap-2.5 rounded-xl px-3 py-2.5 text-sm font-medium transition-colors",
+              active
+                ? "bg-brand-50 text-brand-600 ring-1 ring-inset ring-brand-600 dark:bg-brand-500/10 dark:text-brand-400 dark:ring-brand-500/20"
+                : "text-zinc-500 hover:bg-zinc-100 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
+            )}
+          >
+            <Icon className={cn("h-4 w-4", active ? "text-brand-500 dark:text-brand-400" : "text-zinc-400")} />
+            {label}
+          </Link>
+        );
+      })}
+    </nav>
+  );
+}
+
+function Brand({ trailing, workspace, plan }) {
+  return (
+    <div className="flex items-center justify-between gap-2.5 px-5 py-5">
+      <BrandMark sub={[workspace, plan ? `${plan} plan` : null].filter(Boolean).join(" · ") || "Workspace"} />
+      {trailing}
+    </div>
+  );
+}
+
+function FooterNote({ gmbMock, creditsLeft }) {
+  return (
+    <p className="mx-3 mb-4 rounded-xl bg-zinc-50 px-3 py-3 text-[11px] leading-relaxed text-zinc-500 ring-1 ring-zinc-100 dark:bg-zinc-800/60 dark:text-zinc-400 dark:ring-zinc-800">
+      {creditsLeft !== null ? <span className="block font-medium">{creditsLeft} AI credits left this cycle.</span> : null}
+      {gmbMock ? "Mock GMB mode - nothing is sent to Google." : "Connected listings publish live to Google."}
+    </p>
+  );
+}
+
+export function Sidebar({ mobileOpen = false, onClose, workspace, plan, perms = [], creditsLeft = null, gmbMock = true }) {
+  const pathname = usePathname();
+
+  useEffect(() => {
+    if (!mobileOpen) return undefined;
+    const onKey = (e) => e.key === "Escape" && onClose?.();
+    document.addEventListener("keydown", onKey);
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      document.removeEventListener("keydown", onKey);
+      document.body.style.overflow = prev;
+    };
+  }, [mobileOpen, onClose]);
+
+  return (
+    <>
+      {/* Desktop sidebar */}
+      <aside className="hidden w-64 shrink-0 flex-col border-r border-zinc-200/70 bg-white/80 backdrop-blur-md md:flex dark:border-zinc-800/70 dark:bg-zinc-900/80">
+        <Brand workspace={workspace} plan={plan} />
+        <NavList pathname={pathname} perms={perms} />
+        <FooterNote gmbMock={gmbMock} creditsLeft={creditsLeft} />
+      </aside>
+
+      {/* Mobile drawer */}
+      {mobileOpen ? (
+        <div className="fixed inset-0 z-40 md:hidden">
+          <div className="absolute inset-0 bg-zinc-900/40 backdrop-blur-sm" onClick={onClose} />
+          <aside className="page-enter absolute left-0 top-0 flex h-full w-72 flex-col bg-white shadow-2xl dark:bg-zinc-900">
+            <Brand
+              workspace={workspace}
+              plan={plan}
+              trailing={
+                <button onClick={onClose} aria-label="Close menu" className="rounded-lg p-1.5 text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800">
+                  <X className="h-4 w-4" />
+                </button>
+              }
+            />
+            <NavList pathname={pathname} onNavigate={onClose} perms={perms} />
+            <FooterNote gmbMock={gmbMock} creditsLeft={creditsLeft} />
+          </aside>
+        </div>
+      ) : null}
+    </>
+  );
+}

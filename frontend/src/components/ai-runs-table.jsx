@@ -1,0 +1,53 @@
+import { Pagination } from "@/components/pagination";
+import Link from "next/link";
+import { Card, CardHeader, Table, EmptyRow, Badge, Select } from "@/components/ui";
+import { formatDate, truncate } from "@/lib/utils";
+
+/** Server-paginated AI executions. runs = { items, total, page, limit, pages } */
+export function AiRunsTable({ runs, agents = [], params = {}, onParams, loading = false }) {
+  const rows = runs.items || [];
+  return (
+    <Card>
+      <CardHeader
+        title="Recent executions"
+        subtitle={`${runs.total} matching · newest first`}
+        action={
+          <div className="flex flex-wrap items-center gap-2">
+            <Select value={params.agent || ""} onChange={(e) => onParams({ agent: e.target.value })} className="!w-40">
+              <option value="">All agents</option>
+              {agents.map((a) => <option key={a} value={a}>{a}</option>)}
+            </Select>
+            <Select value={params.status || ""} onChange={(e) => onParams({ status: e.target.value })} className="!w-36">
+              <option value="">All statuses</option>
+              <option value="SUCCESS">Success</option>
+              <option value="FALLBACK">Fallback</option>
+              <option value="FAILED">Failed</option>
+            </Select>
+          </div>
+        }
+      />
+      <Table head={["Time", "Client", "Agent", "Provider", "Model", "Duration", "Status", "Output"]}
+        empty={!rows.length ? <EmptyRow colSpan={8}>No executions match this filter.</EmptyRow> : null}>
+        {rows.map((r) => (
+          <tr key={r.id} className="hover:bg-zinc-50 dark:hover:bg-zinc-800/60">
+            <td className="px-4 py-2 text-xs text-zinc-500 dark:text-zinc-400">{formatDate(r.created_at, true)}</td>
+            <td className="px-4 py-2 text-zinc-600 dark:text-zinc-400">
+              {r.task_id ? (
+                <Link href={`/gmb/tasks/${r.task_id}`} className="hover:text-brand-500 dark:text-brand-400">{r.business_name || "-"}</Link>
+              ) : (r.business_name || "-")}
+            </td>
+            <td className="px-4 py-2 font-medium text-zinc-700 dark:text-zinc-300">{r.agent}</td>
+            <td className="px-4 py-2 text-zinc-600 dark:text-zinc-400">{r.provider}</td>
+            <td className="px-4 py-2 text-xs text-zinc-500 dark:text-zinc-400">{truncate(r.model, 30)}</td>
+            <td className="px-4 py-2 text-zinc-600 dark:text-zinc-400">{r.duration_ms} ms</td>
+            <td className="px-4 py-2">
+              <Badge tone={r.status === "SUCCESS" ? "emerald" : r.status === "FALLBACK" ? "amber" : "red"}>{r.status}</Badge>
+            </td>
+            <td className="px-4 py-2 text-xs text-zinc-500 dark:text-zinc-400">{truncate(r.error || r.output_preview, 60)}</td>
+          </tr>
+        ))}
+      </Table>
+      <Pagination meta={runs} onChange={onParams} loading={loading} />
+    </Card>
+  );
+}

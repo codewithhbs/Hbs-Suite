@@ -1,0 +1,778 @@
+import { assertCanSchedule, withPlanLock, today as planToday } from "../posting/plan.js";
+import { humanizePost } from "./agents/humanize.js";
+import { getSettings } from "../saas/settings.js";
+import { query, one, insert, update } from "../db.js";
+import { TASK_STATUS, QA_PASS_SCORE, IMAGE_REGEN_LIMIT } from "../constants.js";
+import { buildKnowledge } from "../repo/knowledge.js";
+import { runResearchAgent } from "./agents/research.js";
+import { runKeywordAgent, saveKeywords } from "./agents/keyword.js";
+import { runTopicAgent } from "./agents/topic.js";
+import { runContentAgent } from "./agents/content.js";
+import { runQAAgent } from "./agents/qa.js";
+import { checkDuplicate } from "./embeddings.js";
+import { generateImage, generateImageOptions } from "../images/imageService.js";
+import { deleteImage } from "../storage/index.js";
+import {
+  addImageCandidate,
+  listPendingCandidates,
+  getImageCandidate,
+  getSelectedCandidate,
+  markCandidateSelected,
+  markCandidateDeleted,
+  getRecentImageHashes,
+} from "../repo/imageCandidates.js";
+import { resolveEntitlements, assertActive, assertLimit } from "../saas/entitlements.js";
+import { assertCredits, estimatePostCost, creditCostFor } from "../saas/credits.js";
+import { incrementUsage } from "../saas/usage.js";
+import { METRICS, QuotaError } from "../saas/constants.js";
+import { queueEmail } from "../mail/queue.js";
+import { withEngine, explicitEngine, engineKey } from "./engine.js";
+import { nightlySummaryEmail } from "../mail/templates.js";
+
+const IMAGE_OPTIONS_DEFAULT = Number(process.env.IMAGE_OPTIONS_COUNT || 1);
+const IMAGE_OPTIONS_MAX = Number(process.env.IMAGE_OPTIONS_COUNT_MAX || 1); // one image per click (cost)
+
+/** Records a freshly generated image as the task's SELECTED candidate and mirrors it onto ai_tasks. */
+async function saveTaskImage(taskId, tenantId, image) {
+  const candidateId = await addImageCandidate({
+    taskId,
+    tenantId,
+    url: image.url,
+    storageProvider: image.storageProvider || null,
+    storageKey: image.storageKey || null,
+    aiProvider: image.provider,
+    prompt: image.prompt,
+    status: "SELECTED",
+    contentHash: image.contentHash || null,
+  });
+  await update("ai_tasks", taskId, {
+    image_url: image.url,
+    image_provider: image.provider,
+    image_storage_provider: image.storageProvider || null,
+    image_storage_key: image.storageKey || null,
+  });
+  return candidateId;
+}
+
+/** Deletes the task's previously-selected image from storage and marks its candidate row DELETED (best-effort, never throws). */
+async function retireCurrentImage(task) {
+  if (task.image_storage_provider && task.image_storage_key) {
+    await deleteImage(task.image_storage_provider, task.image_storage_key);
+  }
+  const prev = await getSelectedCandidate(task.id);
+  if (prev) await markCandidateDeleted(prev.id);
+}
+
+/**
+ * Research (business summary) and keyword research hardly change from one post to the
+ * next, so they are reused instead of asking the AI every time:
+ *   - Regenerate: the task's own research / keywords
+ *   - New post:   the client's latest ones, if younger than RESEARCH_CACHE_DAYS (7) /
+ *                 KEYWORD_CACHE_DAYS (3).
+ * 0 days = always run the agent.
+ */
+async function reusableStage1(task, { regenerate = false } = {}) {
+  const parse = (v) => {
+    if (!v) return null;
+    if (typeof v === "object") return v;
+    try { return JSON.parse(v); } catch { return null; }
+  };
+  const okKeywords = (k) => Boolean(k && Array.isArray(k.primary_keywords) && k.primary_keywords.length);
+  if (regenerate) {
+    const research = parse(task.research);
+    const keywords = parse(task.keyword_data);
+    return { research: research?.summary ? research : null, keywords: okKeywords(keywords) ? keywords : null };
+  }
+  const rDays = Number(process.env.RESEARCH_CACHE_DAYS ?? 7);
+  const kDays = Number(process.env.KEYWORD_CACHE_DAYS ?? 3);
+  if (rDays <= 0 && kDays <= 0) return { research: null, keywords: null };
+  const row = await one(
+    `SELECT t.research, t.keyword_data, TIMESTAMPDIFF(HOUR, t.created_at, NOW()) AS age_h
+       FROM ai_tasks t
+      WHERE t.client_id=? AND t.id<>? AND t.research IS NOT NULL AND t.keyword_data IS NOT NULL
+        AND t.status NOT IN ('FAILED')
+      ORDER BY t.id DESC LIMIT 1`,
+    [task.client_id, task.id],
+  ).catch(() => null);
+  if (!row) return { research: null, keywords: null };
+  const age = Number(row.age_h || 0);
+  const research = rDays > 0 && age < rDays * 24 ? parse(row.research) : null;
+  const keywords = kDays > 0 && age < kDays * 24 ? parse(row.keyword_data) : null;
+  return { research: research?.summary ? research : null, keywords: okKeywords(keywords) ? keywords : null };
+}
+
+async function setStatus(taskId, status, extra = {}) {
+  await update("ai_tasks", taskId, { status, ...extra });
+}
+
+/**
+ * Full AI pipeline for one task.
+ *
+ * Timing: agents that do not depend on each other run in parallel.
+ *   stage 1  research + keywords      (parallel)
+ *   stage 2  topic
+ *   stage 3  content  -> duplicate check -> one regeneration if too similar
+ *   stage 4  image + QA               (parallel)
+ * That removes roughly 35-40 seconds compared with running all seven in sequence.
+ *
+ * Statuses: PENDING -> RESEARCHING -> KEYWORD_RESEARCH -> GENERATING
+ *           -> IMAGE_GENERATING -> QA_RUNNING -> READY_FOR_REVIEW | NEEDS_REVIEW
+ * On failure the task is kept and marked FAILED with the error message.
+ */
+async function runTaskPipelineCore(taskId, { regenerate = false } = {}) {
+  const task = await one("SELECT * FROM ai_tasks WHERE id=?", [taskId]);
+  if (!task) throw new Error(`Task ${taskId} not found`);
+
+  // "Regenerate" on a post rewrites the text only - the image it already has is kept
+  const keepImage = Boolean(regenerate && task.image_url);
+  const ent = task.tenant_id ? await resolveEntitlements(task.tenant_id) : null;
+  if (ent) {
+    try {
+      assertActive(ent);
+      await assertCredits(task.tenant_id, await estimatePostCost({ withImage: ent.features.f_image_generation && !keepImage }));
+    } catch (err) {
+      await update("ai_tasks", taskId, {
+        status: TASK_STATUS.FAILED,
+        error_message: String(err.message).slice(0, 900),
+      });
+      return { ok: false, taskId, status: TASK_STATUS.FAILED, error: err.message, code: err.code, durationMs: 0 };
+    }
+  }
+
+  const ctx = {
+    taskId,
+    tenantId: task.tenant_id || null,
+    imagesEnabled: ent ? Boolean(ent.features.f_image_generation) : true,
+    seed: `${taskId}-${task.regenerate_count || 0}-${Date.now() % 100000}`,
+  };
+  const startedAt = Date.now();
+
+  try {
+    const kb = await buildKnowledge(task.client_id);
+
+    // ---- stage 1: research + keywords (reused while fresh - see reusableStage1) ----
+    await setStatus(taskId, TASK_STATUS.RESEARCHING, { error_message: null });
+    const cached = await reusableStage1(task, { regenerate });
+    const [research, keywords] = await Promise.all([
+      cached.research ? Promise.resolve(cached.research) : runResearchAgent(kb, ctx),
+      cached.keywords ? Promise.resolve(cached.keywords) : runKeywordAgent(kb, null, ctx),
+    ]);
+    await setStatus(taskId, TASK_STATUS.KEYWORD_RESEARCH, { research, keyword_data: keywords });
+    if (!cached.keywords) saveKeywords(task.client_id, keywords, task.tenant_id).catch((e) => console.error("keyword save:", e.message));
+
+    // ---- stage 2: topic ------------------------------------------------
+    const topic = await runTopicAgent(
+      kb,
+      {
+        keywords,
+        postType: task.post_type || "Service",
+        presetTopic: regenerate ? null : task.topic || null,
+      },
+      ctx
+    );
+    await update("ai_tasks", taskId, {
+      topic: topic.topic,
+      topic_reason: topic.reason,
+      topic_priority: topic.priority,
+    });
+
+    // ---- stage 3: content + duplicate check ----------------------------
+    await setStatus(taskId, TASK_STATUS.GENERATING);
+    const previousTitles = (
+      await query("SELECT title FROM gmb_posts WHERE client_id=? ORDER BY id DESC LIMIT 8", [task.client_id])
+    ).map((r) => r.title);
+    // first sentence of recent posts - the model must not reuse these openings / angles
+    const previousOpenings = (
+      await query(
+        "SELECT description FROM ai_tasks WHERE client_id=? AND id<>? AND description IS NOT NULL AND status NOT IN ('REJECTED','FAILED') ORDER BY id DESC LIMIT 10",
+        [task.client_id, taskId],
+      )
+    ).map((r) => String(r.description).split(/(?<=[.!?])\s/)[0].slice(0, 160));
+
+    const secondary = (keywords.secondary_keywords || []).map((k) => k.keyword);
+    const tertiary = [...(keywords.long_tail_keywords || []), ...(keywords.location_keywords || [])].map((k) => k.keyword);
+
+    // keywords / button chosen in the calendar (or Excel import) win over the agents
+    const cal = task.calendar_id
+      ? await one("SELECT primary_keyword, secondary_keywords, tertiary_keywords, cta FROM content_calendar WHERE id=?", [task.calendar_id]).catch(() => null)
+      : null;
+    const listOf = (v) => String(v || "").split(/[,;|\n]/).map((x) => x.trim().toLowerCase()).filter(Boolean).slice(0, 3);
+    const contentInput = {
+      topic: topic.topic,
+      primaryKeyword: cal?.primary_keyword || topic.target_keyword,
+      secondaryKeywords: listOf(cal?.secondary_keywords).length ? listOf(cal.secondary_keywords) : secondary.slice(0, 3),
+      tertiaryKeywords: listOf(cal?.tertiary_keywords).length ? listOf(cal.tertiary_keywords) : tertiary.slice(0, 3),
+      postType: task.post_type || "Service",
+      service: kb.services.find((s) => topic.topic.toLowerCase().includes(s.toLowerCase())),
+      cta: null,
+      avoidTitles: previousTitles,
+      avoidOpenings: previousOpenings,
+    };
+
+    const presetContent = (c) => ({
+      ...c,
+      ...(cal?.primary_keyword ? { primary_keyword: cal.primary_keyword.toLowerCase() } : {}),
+      ...(listOf(cal?.secondary_keywords).length ? { secondary_keywords: listOf(cal.secondary_keywords) } : {}),
+      ...(listOf(cal?.tertiary_keywords).length ? { tertiary_keywords: listOf(cal.tertiary_keywords) } : {}),
+      ...(cal?.cta ? { cta: cal.cta } : {}),
+    });
+    let content = presetContent(await runContentAgent(kb, contentInput, ctx));
+    let dup = await checkDuplicate({
+      clientId: task.client_id,
+      taskId,
+      title: content.title,
+      description: content.description,
+    });
+
+    if (dup.duplicate) {
+      const match = await one("SELECT description FROM ai_tasks WHERE id=?", [dup.matchTaskId]);
+      content = await runContentAgent(
+        kb,
+        {
+          ...contentInput,
+          topic: `${topic.topic} (completely different angle, structure and opening)`,
+          avoidTitles: [...previousTitles, content.title],
+          avoidOpenings: [...previousOpenings, String(content.description).split(/(?<=[.!?])\s/)[0]],
+          avoidText: match?.description ? String(match.description).slice(0, 600) : null,
+        },
+        { ...ctx, seed: `${ctx.seed}-retry` }
+      );
+      content = presetContent(content);
+      dup = await checkDuplicate({
+        clientId: task.client_id,
+        taskId,
+        title: content.title,
+        description: content.description,
+      });
+    }
+
+    // ---- stage 3b: AI-detection score + humanize rewrite -------------------
+    const hs = await getSettings();
+    let aiCheck = null;
+    if (Number(hs.ai_humanize_enabled) !== 0) {
+      aiCheck = await humanizePost(kb, content, { ctx, target: Number(hs.ai_humanize_threshold) || 35, attempts: 2 });
+      content = { ...content, title: aiCheck.title, description: aiCheck.description };
+    }
+
+    await update("ai_tasks", taskId, {
+      ai_score: aiCheck?.ai_score ?? null,
+      ai_score_original: aiCheck?.ai_score_original ?? null,
+      humanized: aiCheck?.humanized ? 1 : 0,
+      ai_signals: aiCheck ? JSON.stringify(aiCheck.signals) : null,
+      title: content.title,
+      description: content.description,
+      cta: content.cta,
+      primary_keyword: content.primary_keyword,
+      secondary_keywords: content.secondary_keywords,
+      tertiary_keywords: content.tertiary_keywords,
+      image_concept: content.image_concept,
+      embedding: dup.vector,
+      duplicate_score: dup.score,
+      duplicate_of: dup.matchTaskId,
+    });
+
+    // ---- stage 4: image + QA in parallel (no hashtags - not used on GBP) --
+    // ONE image per post. On "Regenerate" the existing image is reused (text only).
+    await setStatus(taskId, keepImage ? TASK_STATUS.QA_RUNNING : TASK_STATUS.IMAGE_GENERATING);
+    const recentImageHashes = keepImage ? new Set() : new Set(await getRecentImageHashes(task.client_id, { excludeTaskId: taskId }));
+    const hashtags = [];
+    const [image, qa] = await Promise.all([
+      keepImage
+        ? Promise.resolve(null)
+        : generateImage(kb, { topic: topic.topic, service: kb.services[0], concept: content.image_concept, title: content.title, subtitle: content.image_subtitle, cta: content.cta }, ctx),
+      runQAAgent(
+        kb,
+        {
+          title: content.title,
+          description: content.description,
+          primary_keyword: content.primary_keyword,
+          cta: content.cta,
+          fallback: content.fallback,
+        },
+        { ...ctx, duplicate: dup.duplicate, duplicateScore: dup.score }
+      ),
+    ]);
+
+    // Same picture as an earlier post: no second (paid) image - just flag it for review.
+    const imageDuplicate = Boolean(image?.contentHash && recentImageHashes.has(image.contentHash));
+    if (imageDuplicate) {
+      qa.warnings = [...(qa.warnings || []), "Generated image matches one already used for this client - regenerate the image or upload one before publishing."];
+    }
+
+    await insert("ai_reviews", {
+      task_id: taskId,
+      score: qa.score,
+      status: qa.status,
+      checks: qa.checks,
+      issues: qa.issues,
+      warnings: qa.warnings,
+    });
+
+    // BUG FIX: content passing the second duplicate check was still let straight
+    // through to READY_FOR_REVIEW (auto-publishable) even when the retry didn't
+    // actually fix it, and a duplicate IMAGE was never checked at all - that's
+    // how the same topic/image ended up going out two days running. Either kind
+    // of duplicate now forces a human to look at it before it can publish.
+    const finalStatus =
+      qa.score >= QA_PASS_SCORE && qa.status === "PASS" && !dup.duplicate && !imageDuplicate
+        ? TASK_STATUS.READY_FOR_REVIEW
+        : TASK_STATUS.NEEDS_REVIEW;
+
+    // image is stored separately: a bad image must never lose the generated post
+    try {
+      if (image) await saveTaskImage(taskId, task.tenant_id || null, image);
+    } catch (imageErr) {
+      console.error("image save failed:", imageErr.message);
+      await update("ai_tasks", taskId, { image_url: null, image_provider: "failed", image_storage_provider: null, image_storage_key: null });
+    }
+
+    await update("ai_tasks", taskId, {
+      hashtags,
+      qa_score: qa.score,
+      qa_status: qa.status,
+      status: finalStatus,
+      error_message: null,
+    });
+
+    if (task.calendar_id) {
+      await update("content_calendar", task.calendar_id, { status: "GENERATED", topic: topic.topic });
+    }
+
+    const spent = await one(
+      "SELECT COALESCE(SUM(credits_charged),0) AS c FROM ai_executions WHERE task_id=?",
+      [taskId]
+    );
+    await update("ai_tasks", taskId, { credits_used: Number(spent?.c || 0) });
+    if (task.tenant_id) await incrementUsage(task.tenant_id, METRICS.POSTS_GENERATED, 1);
+
+    return {
+      ok: true, taskId, status: finalStatus, score: qa.score,
+      credits: Number(spent?.c || 0), durationMs: Date.now() - startedAt,
+    };
+  } catch (err) {
+    await update("ai_tasks", taskId, {
+      status: TASK_STATUS.FAILED,
+      error_message: String(err.message).slice(0, 900),
+    });
+    return { ok: false, taskId, status: TASK_STATUS.FAILED, error: String(err.message), durationMs: Date.now() - startedAt };
+  }
+}
+
+/**
+ * Regenerates ONLY the image for an existing task - text, hashtags, QA etc. are
+ * left untouched. Capped at IMAGE_REGEN_LIMIT (default 2) regenerations per post
+ * to stop runaway image-provider spend; uploading a manual image is unlimited
+ * and does not touch this counter (see app/api/tasks/[id]/image/route.js).
+ */
+/**
+ * AI choice per post (text + image, e.g. "groq|cloudflare"):
+ *   1. picked now (Generate / Regenerate dialog)  -> used + remembered on the task
+ *   2. else remembered on the task, else chosen on its calendar slot
+ *   3. else platform default (AI_BACKGROUND_ENGINE / IMAGE_PROVIDER)
+ * Works before migration v14 too (missing columns are ignored).
+ */
+async function taskEngine(taskId) {
+  try {
+    const r = await one(
+      "SELECT COALESCE(t.ai_engine, c.ai_engine) AS e FROM ai_tasks t LEFT JOIN content_calendar c ON c.id=t.calendar_id WHERE t.id=?",
+      [taskId],
+    );
+    return r?.e || null;
+  } catch {
+    return null;
+  }
+}
+
+async function withTaskEngine(taskId, fn) {
+  const picked = explicitEngine();
+  if (picked) {
+    await query("UPDATE ai_tasks SET ai_engine=? WHERE id=?", [engineKey(picked), taskId]).catch(() => {});
+    return fn();
+  }
+  const stored = await taskEngine(taskId);
+  return stored ? withEngine(stored, fn) : fn();
+}
+
+export async function regenerateTaskImage(taskId, tenantId = null, opts = {}) {
+  return withTaskEngine(taskId, () => regenerateTaskImageCore(taskId, tenantId, opts));
+}
+
+async function regenerateTaskImageCore(taskId, tenantId = null, { styleId = null } = {}) {
+  const task = await one(
+    `SELECT * FROM ai_tasks WHERE id=?${tenantId ? " AND tenant_id=?" : ""}`,
+    tenantId ? [taskId, tenantId] : [taskId]
+  );
+  if (!task) throw new Error(`Task ${taskId} not found`);
+  if (task.status === TASK_STATUS.PUBLISHED) {
+    throw new Error('This post is already live on GMB - upload a replacement image instead so the change reaches Google.');
+  }
+
+  const used = Number(task.image_regen_count || 0);
+  if (used >= IMAGE_REGEN_LIMIT) {
+    throw new QuotaError(
+      `This post's image has already been regenerated ${used}/${IMAGE_REGEN_LIMIT} times - that's the limit. Upload your own image instead.`,
+      "IMAGE_REGEN_LIMIT",
+      { used, limit: IMAGE_REGEN_LIMIT }
+    );
+  }
+
+  const ent = task.tenant_id ? await resolveEntitlements(task.tenant_id) : null;
+  if (ent) {
+    assertActive(ent);
+    if (!ent.features.f_image_generation) {
+      throw new QuotaError("AI image generation is not included in this plan", "FEATURE_LOCKED");
+    }
+    await assertCredits(task.tenant_id, await creditCostFor("image"));
+  }
+
+  const kb = await buildKnowledge(task.client_id);
+  const ctx = {
+    taskId,
+    tenantId: task.tenant_id || null,
+    imagesEnabled: ent ? Boolean(ent.features.f_image_generation) : true,
+    seed: `${taskId}-imgregen-${used + 1}-${Date.now() % 100000}`,
+    styleId,
+  };
+
+  const image = await generateImage(
+    kb,
+    { topic: task.topic || "", service: kb.services[0], concept: task.image_concept || task.topic || "", title: task.title || task.topic || "", cta: task.cta || "" },
+    ctx
+  );
+
+  if (!image.placeholder) await retireCurrentImage(task); // old image is being replaced - clean it out of storage
+  await saveTaskImage(taskId, task.tenant_id || null, image);
+  await update("ai_tasks", taskId, { image_regen_count: used + 1 });
+
+  return { ok: true, taskId, image, regenCount: used + 1, limit: IMAGE_REGEN_LIMIT };
+}
+
+/**
+ * Generates several independent image options for a task and leaves them as
+ * pending candidates - ai_tasks.image_url is untouched until the reviewer
+ * calls selectTaskImage(). Does NOT count against IMAGE_REGEN_LIMIT (that
+ * cap is for the single-image "Regenerate" action); each option still costs
+ * one image credit like any other generation.
+ */
+export async function generateTaskImageOptions(taskId, tenantId = null, count = IMAGE_OPTIONS_DEFAULT, opts = {}) {
+  return withTaskEngine(taskId, () => generateTaskImageOptionsCore(taskId, tenantId, count, opts));
+}
+
+async function generateTaskImageOptionsCore(taskId, tenantId = null, count = IMAGE_OPTIONS_DEFAULT, { styleId = null } = {}) {
+  const task = await one(
+    `SELECT * FROM ai_tasks WHERE id=?${tenantId ? " AND tenant_id=?" : ""}`,
+    tenantId ? [taskId, tenantId] : [taskId]
+  );
+  if (!task) throw new Error(`Task ${taskId} not found`);
+  if (task.status === TASK_STATUS.PUBLISHED) {
+    throw new Error("This post is already live on GMB - upload a replacement image instead so the change reaches Google.");
+  }
+
+  const n = Math.max(1, Math.min(Number(count) || IMAGE_OPTIONS_DEFAULT, IMAGE_OPTIONS_MAX));
+
+  const ent = task.tenant_id ? await resolveEntitlements(task.tenant_id) : null;
+  if (ent) {
+    assertActive(ent);
+    if (!ent.features.f_image_generation) {
+      throw new QuotaError("AI image generation is not included in this plan", "FEATURE_LOCKED");
+    }
+    await assertCredits(task.tenant_id, (await creditCostFor("image")) * n);
+  }
+
+  const kb = await buildKnowledge(task.client_id);
+  const ctx = {
+    taskId,
+    tenantId: task.tenant_id || null,
+    imagesEnabled: ent ? Boolean(ent.features.f_image_generation) : true,
+    seed: `${taskId}-imgopts-${Date.now() % 100000}`,
+    styleId,
+  };
+
+  const images = await generateImageOptions(
+    kb,
+    { topic: task.topic || "", service: kb.services[0], concept: task.image_concept || task.topic || "", title: task.title || task.topic || "", cta: task.cta || "" },
+    ctx,
+    n
+  );
+
+  const candidates = [];
+  for (const image of images) {
+    if (image.placeholder) continue; // a failed slot - don't offer a broken option to pick from
+    const id = await addImageCandidate({
+      taskId,
+      tenantId: task.tenant_id || null,
+      url: image.url,
+      storageProvider: image.storageProvider || null,
+      storageKey: image.storageKey || null,
+      aiProvider: image.provider,
+      prompt: image.prompt,
+      status: "CANDIDATE",
+    });
+    candidates.push({ id, url: image.url, provider: image.provider });
+  }
+
+  if (!candidates.length) {
+    throw new Error("Every image option failed to generate - check the AI execution log for the reason.");
+  }
+
+  return { ok: true, taskId, candidates, requested: n, generated: images.length, failed: images.length - candidates.length };
+}
+
+/**
+ * Finalizes one pending candidate as the task's image: mirrors it onto
+ * ai_tasks, deletes the PREVIOUS selected image (if any) from storage, and
+ * deletes every OTHER pending candidate from that same generation batch from
+ * storage too - only the picked one survives.
+ */
+export async function selectTaskImage(taskId, candidateId, tenantId = null) {
+  const task = await one(
+    `SELECT * FROM ai_tasks WHERE id=?${tenantId ? " AND tenant_id=?" : ""}`,
+    tenantId ? [taskId, tenantId] : [taskId]
+  );
+  if (!task) throw new Error(`Task ${taskId} not found`);
+  if (task.status === TASK_STATUS.PUBLISHED) {
+    throw new Error("This post is already live on GMB - upload a replacement image instead so the change reaches Google.");
+  }
+
+  const chosen = await getImageCandidate(candidateId, taskId);
+  if (!chosen) throw new Error("Image option not found on this task");
+  if (chosen.status === "DELETED") throw new Error("This image option was already deleted");
+
+  if (chosen.status !== "SELECTED") {
+    await retireCurrentImage(task); // drop the image that was live before this pick, if different
+    await markCandidateSelected(chosen.id);
+    await update("ai_tasks", taskId, {
+      image_url: chosen.url,
+      image_provider: chosen.ai_provider,
+      image_storage_provider: chosen.storage_provider,
+      image_storage_key: chosen.storage_key,
+    });
+  }
+
+  const siblings = (await listPendingCandidates(taskId)).filter((c) => c.id !== chosen.id);
+  for (const c of siblings) {
+    if (c.storage_provider && c.storage_key) await deleteImage(c.storage_provider, c.storage_key);
+    await markCandidateDeleted(c.id);
+  }
+
+  return { ok: true, taskId, selected: { id: chosen.id, url: chosen.url }, deleted: siblings.length };
+}
+
+/**
+ * Runs the pipeline, then tells whoever started it (push + notification
+ * center) - they may have switched tab or closed the app while it ran.
+ */
+export async function runTaskPipeline(taskId, opts = {}) {
+  const result = await withTaskEngine(taskId, () => runTaskPipelineCore(taskId, opts));
+  try {
+    const t = await one(
+      "SELECT t.id, t.title, t.status, t.created_by_user_id, t.source, c.business_name FROM ai_tasks t JOIN clients c ON c.id=t.client_id WHERE t.id=?",
+      [taskId],
+    );
+    if (t?.created_by_user_id && t.source !== "api") {
+      const { sendNotification } = await import("../notifications/service.js");
+      const ok = result?.ok !== false && t.status !== TASK_STATUS.FAILED;
+      await sendNotification({
+        userIds: [t.created_by_user_id],
+        type: ok ? "TASK" : "ALERT",
+        title: ok ? `Post ready for review - ${t.business_name}` : `Generation failed - ${t.business_name}`,
+        body: ok ? t.title || "Your AI post has been generated." : result?.error || "Open the task to retry.",
+        link: `/gmb/tasks/${t.id}`,
+        push: true,
+      });
+    }
+  } catch (err) {
+    console.error("[pipeline] completion notification failed:", err.message);
+  }
+  return result;
+}
+
+/** Create a PENDING task from a calendar entry (or ad-hoc for a client). Enforces the client's posting plan. */
+export async function createTask({ clientId, calendarId = null, postType = "Service", topic = null, scheduledDate = null, scheduledTime = null, enforce = true, createdBy = null, source = "app" }) {
+  const client = await one("SELECT tenant_id, assigned_employee_id, active FROM clients WHERE id=?", [clientId]);
+  if (!client) throw new Error("Client not found");
+  if (enforce && client.tenant_id) {
+    const ent = await resolveEntitlements(client.tenant_id);
+    assertActive(ent);
+    assertLimit(ent, "max_posts_month", 1);
+    if (!client.active) throw new QuotaError("This client is inactive", "CLIENT_INACTIVE");
+  }
+  const date = String(scheduledDate || planToday()).slice(0, 10);
+  return withPlanLock(clientId, async () => {
+    if (enforce) await assertCanSchedule(clientId, [date], { excludeCalendarIds: calendarId ? [calendarId] : [] });
+    return insert("ai_tasks", {
+      tenant_id: client.tenant_id,
+      client_id: clientId,
+      calendar_id: calendarId,
+      assigned_employee_id: client ? client.assigned_employee_id : null,
+      status: TASK_STATUS.PENDING,
+      post_type: postType,
+      topic,
+      scheduled_date: date,
+      scheduled_time: /^\d{2}:\d{2}$/.test(String(scheduledTime || "")) ? scheduledTime : null,
+      created_by_user_id: createdBy,
+      source,
+    });
+  });
+}
+
+/**
+ * Nightly job. Picks up every SCHEDULED calendar row for the target date.
+ * Clients are processed in small parallel batches (AI_JOB_CONCURRENCY, default 3)
+ * so 100 clients do not run strictly one after another.
+ */
+export async function runNightlyJob({ date = null, clientId = null, tenantId = null, limit = 100 } = {}) {
+  const targetDate = date || nextDay();
+  // post automation: create calendar entries from posting plans first
+  const { autoScheduleFromPlans } = await import("../posting/autoSchedule.js");
+  const autoScheduled = await autoScheduleFromPlans(targetDate, { clientId, tenantId }).catch((e) => ({ error: e.message }));
+  const params = [targetDate];
+  let sql = `SELECT c.* FROM content_calendar c
+             JOIN clients cl ON cl.id=c.client_id AND cl.active=1
+             JOIN tenants t ON t.id=cl.tenant_id AND t.status='ACTIVE'
+             WHERE c.scheduled_date=? AND c.status='SCHEDULED'`;
+  if (clientId) {
+    sql += " AND c.client_id=?";
+    params.push(clientId);
+  }
+  if (tenantId) {
+    sql += " AND cl.tenant_id=?";
+    params.push(tenantId);
+  }
+  sql += ` ORDER BY c.id LIMIT ${Number(limit)}`;
+
+  const rows = await query(sql, params);
+  const concurrency = Math.max(1, Number(process.env.AI_JOB_CONCURRENCY || 3));
+  const results = [];
+  const startedAt = Date.now();
+
+  for (let i = 0; i < rows.length; i += concurrency) {
+    const batch = rows.slice(i, i + concurrency);
+    const batchResults = await Promise.all(
+      batch.map(async (row) => {
+        // claim the slot so the calendar auto-poster never writes the same entry twice
+        const claim = await query("UPDATE content_calendar SET status='PREPARING' WHERE id=? AND status='SCHEDULED'", [row.id]);
+        if (!claim.affectedRows) return { ok: false, taskId: null, clientId: row.client_id, topic: row.topic, status: "SKIPPED", error: "already being prepared", durationMs: 0 };
+        try {
+          const taskId = await createTask({
+            clientId: row.client_id,
+            calendarId: row.id,
+            postType: row.post_type,
+            topic: row.topic,
+            scheduledDate: row.scheduled_date,
+            scheduledTime: row.scheduled_time,
+            source: "scheduler",
+          });
+          // the AI chosen on the calendar slot wins over the run-wide pick
+          const res = row.ai_engine ? await withEngine(row.ai_engine, () => runTaskPipeline(taskId)) : await runTaskPipeline(taskId);
+          await query("UPDATE content_calendar SET status='SCHEDULED' WHERE id=? AND status='PREPARING'", [row.id]);
+          return { ...res, clientId: row.client_id, topic: row.topic };
+        } catch (err) {
+          await update("content_calendar", row.id, { status: err.code === "PLAN_EXPIRED" ? "PLAN_EXPIRED" : "SKIPPED" });
+          return {
+            ok: false, taskId: null, clientId: row.client_id, topic: row.topic,
+            status: "SKIPPED", error: err.message, code: err.code || "QUOTA",
+            durationMs: 0,
+          };
+        }
+      })
+    );
+    results.push(...batchResults);
+  }
+
+  const durations = results.map((r) => r.durationMs || 0);
+  const summary = {
+    date: targetDate,
+    scheduled: rows.length,
+    generated: results.filter((r) => r.ok).length,
+    failed: results.filter((r) => !r.ok && r.status !== "SKIPPED").length,
+    skipped: results.filter((r) => r.status === "SKIPPED").length,
+    credits: results.reduce((sum, r) => sum + Number(r.credits || 0), 0),
+    ready: results.filter((r) => r.status === TASK_STATUS.READY_FOR_REVIEW).length,
+    needsReview: results.filter((r) => r.status === TASK_STATUS.NEEDS_REVIEW).length,
+    totalMs: Date.now() - startedAt,
+    avgTaskMs: durations.length ? Math.round(durations.reduce((a, b) => a + b, 0) / durations.length) : 0,
+    autoScheduled,
+    results,
+  };
+
+  // All tasks for the night are done -> email each affected tenant a table of
+  // what happened, once, per the nightly run (not per task). Queued so this
+  // never slows down or breaks the scheduler (see lib/mail/queue.js).
+  await emailNightlySummaries(summary);
+
+  return summary;
+}
+
+/**
+ * Groups the night's results by tenant and queues one summary email per
+ * tenant (to the tenant's billing/owner email), each with a table of every
+ * client + post + status generated that night.
+ */
+async function emailNightlySummaries(summary) {
+  if (!summary.results.length) return;
+  try {
+    const clientIds = [...new Set(summary.results.map((r) => r.clientId).filter(Boolean))];
+    if (!clientIds.length) return;
+
+    const clientRows = await query(
+      `SELECT c.id AS client_id, c.business_name, c.tenant_id, t.company_email
+         FROM clients c JOIN tenants t ON t.id=c.tenant_id
+        WHERE c.id IN (${clientIds.map(() => "?").join(",")})`,
+      clientIds
+    );
+    const clientMap = new Map(clientRows.map((c) => [c.client_id, c]));
+
+    const taskIds = summary.results.map((r) => r.taskId).filter(Boolean);
+    const taskTitles = taskIds.length
+      ? await query(`SELECT id, title FROM ai_tasks WHERE id IN (${taskIds.map(() => "?").join(",")})`, taskIds)
+      : [];
+    const titleMap = new Map(taskTitles.map((t) => [t.id, t.title]));
+
+    const byTenant = new Map();
+    for (const r of summary.results) {
+      const c = clientMap.get(r.clientId);
+      if (!c || !c.company_email) continue;
+      if (!byTenant.has(c.tenant_id)) byTenant.set(c.tenant_id, { email: c.company_email, rows: [], generated: 0, failed: 0, credits: 0 });
+      const bucket = byTenant.get(c.tenant_id);
+      bucket.rows.push({
+        client: c.business_name,
+        title: r.taskId ? titleMap.get(r.taskId) || r.topic : r.topic,
+        status: r.ok ? r.status : r.status === "SKIPPED" ? "SKIPPED" : "FAILED",
+        ok: !!r.ok,
+      });
+      if (r.ok) bucket.generated++;
+      else bucket.failed++;
+      bucket.credits += Number(r.credits || 0);
+    }
+
+    const tenantIds = [...byTenant.keys()];
+    if (!tenantIds.length) return;
+    const owners = await query(
+      `SELECT tenant_id, name FROM users WHERE tenant_id IN (${tenantIds.map(() => "?").join(",")}) AND role='OWNER' AND active=1`,
+      tenantIds
+    );
+    const ownerNameMap = new Map(owners.map((o) => [o.tenant_id, o.name]));
+
+    for (const [tenantId, bucket] of byTenant.entries()) {
+      const tpl = nightlySummaryEmail({
+        ownerName: ownerNameMap.get(tenantId) || "there",
+        date: summary.date,
+        rows: bucket.rows,
+        generated: bucket.generated,
+        failed: bucket.failed,
+        credits: bucket.credits,
+        appUrl: process.env.APP_URL || null,
+      });
+      await queueEmail({ to: bucket.email, subject: tpl.subject, html: tpl.html, text: tpl.text, template: "nightly-summary", tenantId });
+    }
+  } catch (err) {
+    console.error("[runNightlyJob] failed to queue nightly summary emails:", err.message);
+  }
+}
+
+function nextDay() {
+  const d = new Date();
+  d.setDate(d.getDate() + 1);
+  return d.toISOString().slice(0, 10);
+}

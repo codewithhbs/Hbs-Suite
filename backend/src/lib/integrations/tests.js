@@ -1,0 +1,148 @@
+import net from "node:net";
+
+async function get(url, opts = {}) {
+  const res = await fetch(url, { ...opts, cache: "no-store", signal: AbortSignal.timeout(10000) });
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`HTTP ${res.status} ${body.slice(0, 160)}`);
+  }
+  return res;
+}
+
+const basic = (u, p) => `Basic ${Buffer.from(`${u}:${p}`).toString("base64")}`;
+
+/** Returns a short success message or throws. Never echoes secrets. */
+export async function runIntegrationTest(id, v) {
+  switch (id) {
+    case "razorpay":
+      await get("https://api.razorpay.com/v1/orders?count=1", { headers: { Authorization: basic(v.key_id, v.key_secret) } });
+      return `Authenticated (${String(v.key_id).startsWith("rzp_test_") ? "test" : "live"} mode)`;
+    case "firebase": {
+      const { fcmAccessToken } = await import("../push/fcm.js");
+      await fcmAccessToken(v.service_account, { force: true });
+      return "Service account OK - FCM access token issued";
+    }
+    case "gemini": {
+      // listing models does not prove the key can generate (disabled service account / billing) -> tiny real call
+      const model = String(v.text_model || "gemini-2.5-flash").trim();
+      const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(v.api_key)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ contents: [{ parts: [{ text: "Reply with OK" }] }], generationConfig: { maxOutputTokens: 5 } }),
+        signal: AbortSignal.timeout(15000),
+      });
+      if (!res.ok) {
+        const msg = (await res.json().catch(() => ({})))?.error?.message || `HTTP ${res.status}`;
+        throw new Error(/service account/i.test(msg) ? `${msg} -> create a NEW key at aistudio.google.com/apikey and paste it here.` : msg);
+      }
+      return `API key valid (${model} answered)`;
+    }
+    case "openai":
+      await get("https://api.openai.com/v1/models", { headers: { Authorization: `Bearer ${v.api_key}` } });
+      return "API key valid";
+    case "groq": {
+      const { listGroqModels } = await import("../ai/providers/groq.js");
+      const models = await listGroqModels(v.api_key);
+      if (!models.length) throw new Error("Key works but no chat model is available");
+      const want = String(v.text_model || "").trim();
+      if (want && !models.includes(want)) return `Key valid. Model "${want}" is NOT available - "${models[0]}" will be used. Available: ${models.slice(0, 6).join(", ")}`;
+      return `Key valid. Using ${want || models[0]}`;
+    }
+    case "cloudflare": {
+      if (!v.account_id) throw new Error("Account ID is required");
+      await get("https://api.cloudflare.com/client/v4/user/tokens/verify", { headers: { Authorization: `Bearer ${v.api_token}` } });
+      return "Token valid";
+    }
+    case "huggingface":
+      await get("https://huggingface.co/api/whoami-v2", { headers: { Authorization: `Bearer ${v.api_key}` } });
+      return "Token valid";
+    case "ollama":
+    {
+      // works with or without /v1 in the base URL
+      const root = String(v.base_url || "http://127.0.0.1:11434").trim().replace(/\/+$/, "").replace(/\/v1$/, "");
+      const res = await fetch(`${root}/api/tags`, { headers: v.api_key ? { Authorization: `Bearer ${v.api_key}` } : {}, signal: AbortSignal.timeout(5000) });
+      if (!res.ok) throw new Error(`HTTP ${res.status} from ${root}/api/tags`);
+      const names = ((await res.json().catch(() => ({})))?.models || []).map((m) => String(m.name || ""));
+      const has = (m) => names.some((n) => n === m || n === `${m}:latest` || n.split(":")[0] === m);
+      const text = v.text_model || process.env.OLLAMA_TEXT_MODEL || "llama3.2";
+      const emb = v.embedding_model || process.env.OLLAMA_EMBEDDING_MODEL || "nomic-embed-text";
+      const missing = [text, emb].filter((m) => !has(m));
+      if (missing.length) throw new Error(`Server reachable, but model not pulled: ${missing.join(", ")} - run: ollama pull ${missing.join(" && ollama pull ")}`);
+      return `Server reachable - ${text} + ${emb} ready`;
+    }
+    case "google":
+      if (!/\.apps\.googleusercontent\.com$/.test(v.client_id || "")) throw new Error("Client ID should end with .apps.googleusercontent.com");
+      if (!v.client_secret) throw new Error("Client secret missing");
+      await get("https://accounts.google.com/.well-known/openid-configuration");
+      return "Credentials look valid (full check happens on the first client connect)";
+    case "ai_detector": {
+      const res = await fetch("https://api.sapling.ai/api/v1/aidetect", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ key: v.api_key, text: "Test sentence for the detector connection check." }), signal: AbortSignal.timeout(10000) });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return "Sapling detector reachable";
+    }
+    case "meta": {
+      const ver = v.graph_version || "v21.0";
+      const res = await fetch(`https://graph.facebook.com/${ver}/oauth/access_token?client_id=${encodeURIComponent(v.app_id)}&client_secret=${encodeURIComponent(v.app_secret)}&grant_type=client_credentials`, { signal: AbortSignal.timeout(10000) });
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok || !j.access_token) throw new Error(j.error?.message || `HTTP ${res.status}`);
+      return "Meta app credentials are valid";
+    }
+    case "website_builder": {
+      const res = await fetch(`${String(v.api_base || "").replace(/\/$/, "")}/integration/sso`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-integration-key": v.integration_key },
+        body: JSON.stringify({ tenantId: "connection-test", tenantName: "Connection test" }),
+        signal: AbortSignal.timeout(10000),
+      });
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok || !j.token) throw new Error(j.message || `HTTP ${res.status}`);
+      return `Website builder reachable (sites on *.${j.rootDomain})`;
+    }
+    case "google_places": {
+      const res = await fetch("https://places.googleapis.com/v1/places:searchText", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Goog-Api-Key": v.api_key, "X-Goog-FieldMask": "places.id" },
+        body: JSON.stringify({ textQuery: "dentist in Delhi", pageSize: 1 }),
+        signal: AbortSignal.timeout(10000),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status} ${(await res.text()).slice(0, 160)}`);
+      return "Places API (New) reachable";
+    }
+    case "smtp": {
+      const nodemailer = (await import("nodemailer")).default;
+      const t = nodemailer.createTransport({
+        host: v.host,
+        port: Number(v.port || 587),
+        secure: String(v.secure) === "true",
+        auth: v.user ? { user: v.user, pass: v.pass } : undefined,
+        connectionTimeout: 8000,
+      });
+      await t.verify();
+      return "SMTP login OK";
+    }
+    case "s3":
+    case "r2":
+    case "cloudinary": {
+      const { getStorageChain, resetStorageChain } = await import("../storage/index.js");
+      resetStorageChain();
+      const chain = getStorageChain();
+      if (!chain.length) throw new Error("No storage provider configured");
+      return `Configured - active chain: ${chain.map((p) => p.name).join(" -> ")}`;
+    }
+    case "analytics":
+      if (!/^G-[A-Z0-9]{4,}$/.test(v.measurement_id || "")) throw new Error("Measurement ID should look like G-XXXXXXX");
+      return "Format OK";
+    case "webhooks": {
+      const u = new URL(v.url);
+      if (u.protocol !== "https:") throw new Error("Webhook URL must be https");
+      await new Promise((resolve, reject) => {
+        const s = net.connect({ host: u.hostname, port: Number(u.port || 443), timeout: 6000 }, () => { s.end(); resolve(); });
+        s.on("error", reject);
+        s.on("timeout", () => { s.destroy(); reject(new Error("Timeout")); });
+      });
+      return "Endpoint reachable";
+    }
+    default:
+      throw new Error("No test available");
+  }
+}

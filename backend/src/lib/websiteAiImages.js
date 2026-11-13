@@ -19,7 +19,7 @@ export function plannedImages(prefill) {
 
 /** Throws (before anything is created) if AI images can't be used for this tenant. */
 export async function assertAiImagesAllowed(tenantId, count) {
-  if (!aiImagesAvailable()) throw Object.assign(new Error("No AI image provider is configured (Gemini / OpenAI / Hugging Face)."), { status: 400 });
+  if (!(await aiImagesAvailable())) throw Object.assign(new Error("No AI image provider is configured (Gemini / OpenAI / Hugging Face)."), { status: 400 });
   const ent = await resolveEntitlements(tenantId);
   if (ent && !ent.features?.f_image_generation) throw Object.assign(new Error("AI image generation isn't included in your plan."), { status: 403 });
   const unit = Number(await creditCostFor("image").catch(() => 0)) || 0;

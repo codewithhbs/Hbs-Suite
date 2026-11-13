@@ -5,6 +5,7 @@ import * as imagePrompt from "../ai/prompts/image.js";
 import { renderCreative, renderLogoOverlay, toDataUrl } from "./creative.js";
 import { resolveStyle, renderStyle, styleVars, imageButtonEnabled, withoutButton } from "./styles.js";
 import { one } from "../db.js";
+import { getSettings } from "../saas/settings.js";
 import { fitText, IMAGE_TITLE_MAX_CHARS } from "../ai/textPolicy.js";
 
 /**
@@ -34,10 +35,17 @@ function hasImageModel(p) {
   return Boolean(p.imageModel);
 }
 
-/** Images: Gemini only by default (IMAGE_PROVIDER), never Ollama / Mock. */
-function imageCandidateProviders() {
+/** Admin switch (Web settings -> "Gemini images"). OFF = Gemini never makes images (Cloudflare etc. only). */
+export async function geminiImagesEnabled() {
+  const s = await getSettings().catch(() => ({}));
+  return Number(s.gemini_images_enabled ?? 1) === 1;
+}
+
+/** Images: Gemini first by default (IMAGE_PROVIDER), never Ollama / Mock. Gemini dropped when the admin switched it off. */
+async function imageCandidateProviders() {
+  const geminiOn = await geminiImagesEnabled();
   return getImageChain().filter(
-    (p) => typeof p.image === "function" && p.name !== "mock" && p.isConfigured() && hasImageModel(p)
+    (p) => typeof p.image === "function" && p.name !== "mock" && p.isConfigured() && hasImageModel(p) && (geminiOn || p.name !== "gemini")
   );
 }
 
@@ -98,7 +106,7 @@ export async function generateImage(kb, { topic, service, concept, title = null,
   }
 
   // Gemini only by default (IMAGE_PROVIDER=auto adds OpenAI / Hugging Face).
-  const candidates = imageCandidateProviders();
+  const candidates = await imageCandidateProviders();
 
   if (!candidates.length) {
     const reason = "No image AI configured - set GEMINI_API_KEY or Cloudflare Workers AI (Admin -> Integrations)";
@@ -272,7 +280,7 @@ function esc(s) {
  * is configured / all fail. Charged like any AI image.
  */
 export async function generatePhoto(kb, { subject, scene = null, tag = "web" }, ctx = {}) {
-  const candidates = imageCandidateProviders();
+  const candidates = await imageCandidateProviders();
   if (!candidates.length) return null;
   const prompt = [
     scene || `A realistic professional photograph for the website of ${kb.business}, a ${kb.category} in ${kb.city}`,
@@ -299,8 +307,8 @@ export async function generatePhoto(kb, { subject, scene = null, tag = "web" }, 
 }
 
 /** True when at least one real AI image provider is set up. */
-export function aiImagesAvailable() {
-  return imageCandidateProviders().length > 0;
+export async function aiImagesAvailable() {
+  return (await imageCandidateProviders()).length > 0;
 }
 
 /**
@@ -319,7 +327,7 @@ export async function previewStyleImage(kb, style, sample = {}) {
   };
   const showButton = await imageButtonEnabled();
   const prompt = renderStyle(showButton ? style.prompt || "" : withoutButton(style.prompt || ""), styleVars(kb, input, client?.brand_color));
-  const candidates = imageCandidateProviders();
+  const candidates = await imageCandidateProviders();
   let buffer = null;
   let contentType = "image/png";
   let provider = "none";

@@ -25,6 +25,7 @@ export const GET = route({ permission: "gmb.view" }, async ({ ctx, params }) => 
     return { configured: true, unavailable: true, error: e.message, websites: [] };
   }
 });
+
 /**
  * POST { action: "create" | "edit" | "publish" | "unpublish" | "delete", website_id? }
  * create/edit return { url } - the builder panel opened already signed in.
@@ -61,7 +62,7 @@ export const POST = route({ permission: "gmb.edit" }, async ({ ctx, params, requ
       // what will be filled - shown in the dialog before creating
       const prefill = await buildPrefill(id);
       const n = plannedImages(prefill);
-      return { prefill, ai: { available: aiImagesAvailable(), images: n, credits: n * (Number(await creditCostFor("image").catch(() => 0)) || 0) } };
+      return { prefill, ai: { available: await aiImagesAvailable(), images: n, credits: n * (Number(await creditCostFor("image").catch(() => 0)) || 0) } };
     }
     case "create_from_gmb": {
       if (!b.theme_id || !b.slug) throw Object.assign(new Error("Pick a theme and a web address."), { status: 400 });

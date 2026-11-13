@@ -22,12 +22,25 @@ export async function wbConfig() {
 async function wb(path, { method = "GET", body } = {}) {
   const cfg = await wbConfig();
   if (!cfg.configured) throw bad("Website builder is not configured (Admin -> Integrations -> Website Builder).", 503);
-  const res = await fetch(`${cfg.api}/integration${path}`, {
-    method,
-    headers: { "Content-Type": "application/json", "x-integration-key": cfg.key },
-    body: body ? JSON.stringify(body) : undefined,
-    signal: AbortSignal.timeout(15000),
-  });
+  let res;
+  try {
+    res = await fetch(`${cfg.api}/integration${path}`, {
+      method,
+      headers: { "Content-Type": "application/json", "x-integration-key": cfg.key },
+      body: body ? JSON.stringify(body) : undefined,
+      signal: AbortSignal.timeout(15000),
+    });
+  } catch (e) {
+    const code = e?.cause?.code || e?.code || e?.name || "NETWORK";
+    const why =
+      code === "CERT_HAS_EXPIRED" ? "SSL certificate of the website builder API has expired - renew it (certbot renew)" :
+      /CERT|SSL|TLS/i.test(code) ? `SSL error talking to the website builder API (${code})` :
+      code === "ECONNREFUSED" ? "Website builder API is not running (connection refused)" :
+      code === "ENOTFOUND" ? "Website builder API host not found - check api_base" :
+      code === "TimeoutError" ? "Website builder API timed out" :
+      `Website builder API unreachable (${code})`;
+    throw bad(`${why}. URL: ${cfg.api}`, 502);
+  }
   const j = await res.json().catch(() => ({}));
   if (!res.ok || j.success === false) throw bad(j.message || `Website builder error ${res.status}`, res.status >= 500 ? 502 : res.status);
   return j;

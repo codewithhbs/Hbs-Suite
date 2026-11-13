@@ -617,6 +617,74 @@ export async function createTask({ clientId, calendarId = null, postType = "Serv
 }
 
 /**
+ * Writes the post for ONE calendar slot: claim -> task -> AI pipeline.
+ * `claimed` = the caller already moved the row to PREPARING (Generate now button).
+ * The AI chosen on the slot (row.ai_engine) wins over the run-wide pick.
+ */
+export async function generateCalendarRow(row, { claimed = false, source = "scheduler" } = {}) {
+  if (!claimed) {
+    const claim = await query("UPDATE content_calendar SET status='PREPARING' WHERE id=? AND status='SCHEDULED'", [row.id]);
+    if (!claim.affectedRows) return { ok: false, taskId: null, clientId: row.client_id, topic: row.topic, status: "SKIPPED", error: "already being prepared", durationMs: 0 };
+  }
+  try {
+    const taskId = await createTask({
+      clientId: row.client_id,
+      calendarId: row.id,
+      postType: row.post_type,
+      topic: row.topic,
+      scheduledDate: String(row.scheduled_date instanceof Date ? row.scheduled_date.toLocaleDateString("en-CA") : row.scheduled_date).slice(0, 10),
+      scheduledTime: row.scheduled_time,
+      source,
+    });
+    const res = row.ai_engine ? await withEngine(row.ai_engine, () => runTaskPipeline(taskId)) : await runTaskPipeline(taskId);
+    return { ...res, clientId: row.client_id, topic: row.topic };
+  } catch (err) {
+    await update("content_calendar", row.id, { status: err.code === "PLAN_EXPIRED" ? "PLAN_EXPIRED" : "SKIPPED" });
+    return {
+      ok: false, taskId: null, clientId: row.client_id, topic: row.topic,
+      status: "SKIPPED", error: err.message, code: err.code || "QUOTA",
+      durationMs: 0,
+    };
+  } finally {
+    // back to SCHEDULED unless the pipeline moved it on (GENERATED / SKIPPED)
+    await query("UPDATE content_calendar SET status='SCHEDULED' WHERE id=? AND status='PREPARING'", [row.id]).catch(() => {});
+  }
+}
+
+/**
+ * "Generate now" from the calendar: every given slot is written at the same time
+ * (CALENDAR_NOW_CONCURRENCY in parallel, default 5) instead of waiting for the night run.
+ * Rows must already be claimed (PREPARING). One summary notification at the end.
+ */
+export async function generateCalendarNow({ rows, userId = null }) {
+  const limit = Math.max(1, Number(process.env.CALENDAR_NOW_CONCURRENCY || 5));
+  const results = [];
+  for (let i = 0; i < rows.length; i += limit) {
+    const batch = rows.slice(i, i + limit);
+    results.push(...(await Promise.all(batch.map((row) => generateCalendarRow(row, { claimed: true, source: "calendar" })))));
+  }
+  const ok = results.filter((r) => r.ok).length;
+  const failed = results.length - ok;
+  if (userId) {
+    try {
+      const { sendNotification } = await import("../notifications/service.js");
+      const firstTask = results.find((r) => r.taskId)?.taskId;
+      await sendNotification({
+        userIds: [userId],
+        type: failed && !ok ? "ALERT" : "TASK",
+        title: `Generate now finished: ${ok}/${results.length} posts ready`,
+        body: failed ? `${failed} failed - ${results.find((r) => !r.ok)?.error || "open the task to retry"}` : "All posts are written - review them in Tasks.",
+        link: results.length === 1 && firstTask ? `/gmb/tasks/${firstTask}` : "/gmb/tasks",
+        push: true,
+      });
+    } catch (err) {
+      console.error("[calendar-now] notification failed:", err.message);
+    }
+  }
+  return { total: results.length, generated: ok, failed, results };
+}
+
+/**
  * Nightly job. Picks up every SCHEDULED calendar row for the target date.
  * Clients are processed in small parallel batches (AI_JOB_CONCURRENCY, default 3)
  * so 100 clients do not run strictly one after another.
@@ -630,7 +698,8 @@ export async function runNightlyJob({ date = null, clientId = null, tenantId = n
   let sql = `SELECT c.* FROM content_calendar c
              JOIN clients cl ON cl.id=c.client_id AND cl.active=1
              JOIN tenants t ON t.id=cl.tenant_id AND t.status='ACTIVE'
-             WHERE c.scheduled_date=? AND c.status='SCHEDULED'`;
+             WHERE c.scheduled_date=? AND c.status='SCHEDULED'
+               AND NOT EXISTS (SELECT 1 FROM ai_tasks a WHERE a.calendar_id=c.id)`;
   if (clientId) {
     sql += " AND c.client_id=?";
     params.push(clientId);
@@ -648,36 +717,7 @@ export async function runNightlyJob({ date = null, clientId = null, tenantId = n
 
   for (let i = 0; i < rows.length; i += concurrency) {
     const batch = rows.slice(i, i + concurrency);
-    const batchResults = await Promise.all(
-      batch.map(async (row) => {
-        // claim the slot so the calendar auto-poster never writes the same entry twice
-        const claim = await query("UPDATE content_calendar SET status='PREPARING' WHERE id=? AND status='SCHEDULED'", [row.id]);
-        if (!claim.affectedRows) return { ok: false, taskId: null, clientId: row.client_id, topic: row.topic, status: "SKIPPED", error: "already being prepared", durationMs: 0 };
-        try {
-          const taskId = await createTask({
-            clientId: row.client_id,
-            calendarId: row.id,
-            postType: row.post_type,
-            topic: row.topic,
-            scheduledDate: row.scheduled_date,
-            scheduledTime: row.scheduled_time,
-            source: "scheduler",
-          });
-          // the AI chosen on the calendar slot wins over the run-wide pick
-          const res = row.ai_engine ? await withEngine(row.ai_engine, () => runTaskPipeline(taskId)) : await runTaskPipeline(taskId);
-          await query("UPDATE content_calendar SET status='SCHEDULED' WHERE id=? AND status='PREPARING'", [row.id]);
-          return { ...res, clientId: row.client_id, topic: row.topic };
-        } catch (err) {
-          await update("content_calendar", row.id, { status: err.code === "PLAN_EXPIRED" ? "PLAN_EXPIRED" : "SKIPPED" });
-          return {
-            ok: false, taskId: null, clientId: row.client_id, topic: row.topic,
-            status: "SKIPPED", error: err.message, code: err.code || "QUOTA",
-            durationMs: 0,
-          };
-        }
-      })
-    );
-    results.push(...batchResults);
+    results.push(...(await Promise.all(batch.map((row) => generateCalendarRow(row)))));
   }
 
   const durations = results.map((r) => r.durationMs || 0);

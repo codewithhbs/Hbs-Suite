@@ -25,7 +25,7 @@ export default function CalendarPage() {
         <h1 className="text-lg font-semibold text-zinc-900 dark:text-zinc-100">Content calendar</h1>
         <p className="text-sm text-zinc-500 dark:text-zinc-400">Plan, schedule and manage your GMB posts with ease.</p>
       </div>
-      {data ? <CalendarBoard entries={data.entries} clients={data.clients} onMonthChange={onMonthChange} /> : <PageState loading={loading} error={error} />}
+      {data ? <CalendarBoard entries={data.entries} clients={data.clients} onMonthChange={onMonthChange} canGenerate={data.canGenerate !== false} /> : <PageState loading={loading} error={error} />}
     </div>
   );
 }

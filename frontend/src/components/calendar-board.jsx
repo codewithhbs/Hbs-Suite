@@ -2,7 +2,7 @@ import { useState, useMemo , useEffect} from "react";
 import { CalendarImport } from "@/components/calendar-import";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
-import { Plus, Trash2, Sparkles, Calendar, ChevronLeft, ChevronRight, X, Loader2 } from "lucide-react";
+import { Plus, Trash2, Sparkles, Calendar, ChevronLeft, ChevronRight, X, Loader2, Zap } from "lucide-react";
 import { Badge, Button, Card, CardBody, CardHeader, Field, Input, Select } from "@/components/ui";
 import { POST_TYPES } from "@/lib/constants";
 import { usePlanUsage, PlanUsageInline } from "@/components/posting/plan-usage";
@@ -28,7 +28,7 @@ function toISO(d) { return d.toISOString().slice(0, 10); }
 function monthKey(d) { return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`; }
 function fmtMonth(d) { return d.toLocaleDateString("en-US", { month: "long", year: "numeric" }); }
 
-export function CalendarBoard({ entries, clients, onMonthChange }) {
+export function CalendarBoard({ entries, clients, onMonthChange, canGenerate = true }) {
   const [engineDialog, askEngine] = useEngineChoice();
   const router = useRouter();
   const [cursor, setCursor] = useState(() => { const t = new Date(); return new Date(t.getFullYear(), t.getMonth(), 1); });
@@ -167,18 +167,34 @@ export function CalendarBoard({ entries, clients, onMonthChange }) {
     router.refresh();
   }
 
-  async function runDay(date) {
-    const engine = await askEngine();
-    if (!engine) return;
-    setBusy(date); setMsg("");
-    const res = await fetch("/api/ai/nightly", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ date, engine }) });
-    const data = await res.json();
+  /** Generate now: writes the given slots at the same time instead of waiting for the night run. */
+  async function generateNow(ids, { askAi = false, label = "" } = {}) {
+    if (!ids.length) return;
+    let engine = null;
+    if (askAi) {
+      engine = await askEngine();
+      if (!engine) return;
+    }
+    setBusy(label || `gen-${ids[0]}`); setMsg("");
+    const res = await fetch("/api/calendar/generate", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ids, engine }) });
+    const data = await res.json().catch(() => ({}));
     setBusy("");
-    setMsg(data.error || `${date}: ${data.generated}/${data.scheduled} generated, ${data.ready} ready, ${data.needsReview} need review`);
+    if (!res.ok) return setMsg(data.error || "Could not start generation");
+    setMsg(`Generating ${data.queued} post${data.queued === 1 ? "" : "s"} now - they turn GENERATED when ready (you get a notification).`);
     router.refresh();
   }
 
+  // while any slot is being written, refresh every 5s so the status updates by itself
+  const preparing = entries.some((e) => e.status === "PREPARING");
+  useEffect(() => {
+    if (!preparing) return undefined;
+    const t = setInterval(() => router.refresh(), 5000);
+    return () => clearInterval(t);
+  }, [preparing]); // eslint-disable-line react-hooks/exhaustive-deps
+
   const selectedEntries = byDate.get(selected) || [];
+  const canGen = (e) => canGenerate && e.status === "SCHEDULED" && !e.task_id;
+  const openIds = selectedEntries.filter(canGen).map((e) => e.id);
   const todayISO = toISO(new Date());
   const activeClient = clients.find((c) => String(c.id) === String(clientFilter));
 
@@ -309,10 +325,12 @@ export function CalendarBoard({ entries, clients, onMonthChange }) {
           <Card>
             <CardHeader title="Quick actions" />
             <CardBody className="space-y-2">
-              <Button className="w-full justify-center" onClick={() => runDay(selected)} disabled={busy === selected}>
-                {busy === selected ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />}
-                Run AI job ({selected})
-              </Button>
+              {canGenerate ? (
+                <Button className="w-full justify-center" onClick={() => generateNow(openIds, { askAi: true, label: `day-${selected}` })} disabled={!openIds.length || busy === `day-${selected}`}>
+                  {busy === `day-${selected}` ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Zap className="h-3.5 w-3.5" />}
+                  {openIds.length ? `Generate now (${openIds.length} post${openIds.length === 1 ? "" : "s"})` : "Nothing to generate"}
+                </Button>
+              ) : null}
               <Button variant="secondary" className="w-full justify-center" onClick={openAdd}>
                 <Plus className="h-3.5 w-3.5" /> Add post to this day
               </Button>
@@ -341,7 +359,11 @@ export function CalendarBoard({ entries, clients, onMonthChange }) {
                     <p className="truncate text-sm font-medium text-zinc-800 dark:text-zinc-100">{e.business_name}</p>
                     <p className="truncate text-xs text-zinc-500 dark:text-zinc-400">{e.topic || "AI will choose topic"}</p>
                   </div>
-                  <Badge tone={e.status === "GENERATED" ? "emerald" : "slate"}>{e.status}</Badge>
+                  {e.status === "PREPARING" ? (
+                    <Badge tone="amber"><Loader2 className="mr-1 inline h-3 w-3 animate-spin" />Generating</Badge>
+                  ) : (
+                    <Badge tone={e.status === "GENERATED" ? "emerald" : e.status === "SKIPPED" || e.status === "PUBLISH_FAILED" ? "red" : "slate"}>{e.status}</Badge>
+                  )}
                 </div>
                 {e.status === "SCHEDULED" ? (
                   <AiComboSelect compact className="mt-2 [&_select]:!py-1 [&_select]:!text-[11px]" value={e.ai_engine || ""} onChange={(v) => changeAi(e.id, v)} />
@@ -351,6 +373,17 @@ export function CalendarBoard({ entries, clients, onMonthChange }) {
                 <div className="mt-2 flex items-center justify-between">
                   <span className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${c.bg} ${c.text}`}>{e.post_type}</span>
                   <div className="flex items-center gap-2">
+                    {canGen(e) ? (
+                      <button
+                        onClick={() => generateNow([e.id])}
+                        disabled={busy === `gen-${e.id}`}
+                        className="inline-flex items-center gap-1 rounded-md bg-brand-500 px-2 py-1 text-[11px] font-semibold text-white hover:bg-brand-600 disabled:opacity-60"
+                        title="Write this post now instead of waiting for the night run"
+                      >
+                        {busy === `gen-${e.id}` ? <Loader2 className="h-3 w-3 animate-spin" /> : <Zap className="h-3 w-3" />}
+                        Generate now
+                      </button>
+                    ) : null}
                     {e.task_id ? <Link href={`/gmb/tasks/${e.task_id}`} className="text-xs font-medium text-brand-500 hover:text-brand-600">View task</Link> : null}
                     {e.status === "SCHEDULED" ? (
                       <button onClick={() => removeEntry(e.id)} className="text-zinc-400 hover:text-red-600" aria-label="Remove entry">

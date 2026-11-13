@@ -180,14 +180,15 @@ router.get(
     const [entries, clients] = await Promise.all([
       query(
         `SELECT c.*, cl.business_name,
-                (SELECT t.id FROM ai_tasks t WHERE t.calendar_id=c.id ORDER BY t.id DESC LIMIT 1) AS task_id
+                (SELECT t.id FROM ai_tasks t WHERE t.calendar_id=c.id ORDER BY t.id DESC LIMIT 1) AS task_id,
+                (SELECT t.status FROM ai_tasks t WHERE t.calendar_id=c.id ORDER BY t.id DESC LIMIT 1) AS task_status
            FROM content_calendar c JOIN clients cl ON cl.id=c.client_id
           WHERE c.scheduled_date BETWEEN ? AND ? AND c.tenant_id=?${clientScopeInline("c.client_id", ctx)} ORDER BY c.scheduled_date, cl.business_name LIMIT 2000`,
         [from, to, ctx.tenantId],
       ),
       query(`SELECT id, business_name FROM clients WHERE active=1 AND tenant_id=?${clientScopeInline("id", ctx)} ORDER BY business_name`, [ctx.tenantId]),
     ]);
-    return { entries: plain(entries), clients: plain(clients), from, to };
+     return { entries: plain(entries), clients: plain(clients), from, to, canGenerate: ctx.can("task.generate") };
   }),
 );
 

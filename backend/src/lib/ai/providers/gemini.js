@@ -58,7 +58,37 @@ function repairJson(text) {
 
 /** Models that cannot write text (image / embedding / audio / video). */
 const NOT_TEXT = /image|imagen|embedding|embed|tts|veo|aqa|live|native-audio/i;
-const SAFE_TEXT_MODEL = "gemini-2.5-flash";
+/** Google retires model names for new keys often - this alias always points at the current Flash. */
+const SAFE_TEXT_MODEL = "gemini-flash-latest";
+/** Best first when the configured model is gone. Cheap + fast "flash" models only (no pro = cost). */
+const PREFERRED = [
+  "gemini-flash-latest",
+  "gemini-3-flash",
+  "gemini-3-flash-preview",
+  "gemini-2.5-flash",
+  "gemini-flash-lite-latest",
+  "gemini-2.5-flash-lite",
+  "gemini-2.0-flash",
+];
+const MODEL_GONE = /no longer available|is not found|not found for API version|not supported for generateContent|does not exist|deprecated|has been shut down/i;
+const CACHE_MS = 6 * 60 * 60 * 1000;
+let resolved = { key: "", model: null, at: 0 }; // text model picked from the live list for this key
+let listCache = { key: "", list: null, at: 0 };
+
+/** Live text models for this key, best first. */
+export async function listGeminiTextModels(apiKey = process.env.GEMINI_API_KEY) {
+  if (listCache.key === apiKey && listCache.list && Date.now() - listCache.at < 10 * 60 * 1000) return listCache.list;
+  const res = await fetch(`${BASE}/models?pageSize=1000`, { headers: { "x-goog-api-key": apiKey }, signal: AbortSignal.timeout(10000) });
+  if (!res.ok) throw new Error(`Gemini models ${res.status}: ${(await res.text().catch(() => "")).slice(0, 200)}`);
+  const ids = ((await res.json())?.models || [])
+    .filter((m) => (m.supportedGenerationMethods || []).includes("generateContent"))
+    .map((m) => String(m.name || "").replace(/^models\//, ""))
+    .filter((id) => id.startsWith("gemini") && !NOT_TEXT.test(id));
+  const flash = ids.filter((id) => /flash/i.test(id) && !/thinking|exp/i.test(id));
+  const ranked = [...new Set([...PREFERRED.filter((id) => ids.includes(id)), ...flash, ...ids.filter((id) => !/pro|ultra/i.test(id))])];
+  listCache = { key: apiKey, list: ranked, at: Date.now() };
+  return ranked;
+}
 const NO_JSON_MODE = /JSON mode is not enabled|response_mime_type|responseMimeType|response mime type/i;
 const NO_SYSTEM = /Developer instruction is not enabled|system_instruction|systemInstruction/i;
 /** models found (at runtime) not to support JSON mode / system instructions */
@@ -72,8 +102,10 @@ export class GeminiProvider {
     this.apiKey = process.env.GEMINI_API_KEY || "";
     const configured = (process.env.GEMINI_TEXT_MODEL || "").trim() || SAFE_TEXT_MODEL;
     // an image / embedding model in the TEXT model field -> 400 errors on every post; use a text model instead
-    this.textModel = NOT_TEXT.test(configured) ? SAFE_TEXT_MODEL : configured;
-    if (this.textModel !== configured && warnedModel !== configured) {
+    const usable = NOT_TEXT.test(configured) ? SAFE_TEXT_MODEL : configured;
+    // a model found retired earlier for this key -> use the replacement picked then
+    this.textModel = resolved.key === this.apiKey && resolved.model && resolved.from === usable && Date.now() - resolved.at < CACHE_MS ? resolved.model : usable;
+    if (NOT_TEXT.test(configured) && warnedModel !== configured) {
       warnedModel = configured;
       console.warn(`[gemini] GEMINI_TEXT_MODEL "${configured}" cannot write text - using "${SAFE_TEXT_MODEL}". Fix it in Admin -> Integrations -> Google Gemini -> Text model.`);
     }
@@ -87,6 +119,21 @@ export class GeminiProvider {
 
   isConfigured() {
     return Boolean(this.apiKey);
+  }
+
+  /** First live text model for this key that is not `gone`. Cached per key. */
+  async #replacementModel(gone) {
+    try {
+      const list = (await listGeminiTextModels(this.apiKey)).filter((id) => id !== gone);
+      if (!list.length) return null;
+      resolved = { key: this.apiKey, model: list[0], from: this.textModel, at: Date.now() };
+      console.warn(`[gemini] model "${gone}" is not available for this key - using "${list[0]}". Set it in Admin -> Integrations -> Google Gemini -> Text model.`);
+      this.textModel = list[0];
+      return list[0];
+    } catch (err) {
+      console.warn("[gemini] could not list models:", err.message);
+      return gone === SAFE_TEXT_MODEL ? null : SAFE_TEXT_MODEL;
+    }
   }
 
   async #post(path, body, { timeout = this.timeout } = {}) {
@@ -128,7 +175,7 @@ export class GeminiProvider {
     if (!this.isConfigured()) throw new Error("GEMINI_API_KEY not configured");
     if (!prompt) throw new Error("Prompt is required");
 
-    const model = this.textModel;
+    let model = this.textModel;
     const buildConfig = (jsonMode) => ({
       // Thinking models spend output budget on thoughts, so never go below 1024.
       maxOutputTokens: Math.max(Number(maxTokens) || 1024, 1024),
@@ -180,6 +227,16 @@ export class GeminiProvider {
           systemField = false;
           continue;
         }
+        // model retired for this key ("no longer available to new users") -> pick a live one and retry
+        if (attempt < 3 && /^404|^400/.test(msg) && MODEL_GONE.test(msg)) {
+          const next = await this.#replacementModel(model);
+          if (next) {
+            model = next;
+            jsonMode = json && !noJsonModels.has(model);
+            systemField = !noSystemModels.has(model);
+            continue;
+          }
+        }
         throw err;
       }
     }
@@ -218,7 +275,7 @@ export class GeminiProvider {
     // Do not let truncated output reach runAI as a success.
     if (finishReason === "MAX_TOKENS") {
       throw new Error(
-        `Gemini response was truncated because max output tokens were reached. Model: ${this.textModel}`,
+        `Gemini response was truncated because max output tokens were reached. Model: ${model}`,
       );
     }
 
@@ -256,7 +313,7 @@ export class GeminiProvider {
 
     return {
       text: finalText,
-      model: this.textModel,
+      model,
       inputTokens: data?.usageMetadata?.promptTokenCount ?? null,
       outputTokens: data?.usageMetadata?.candidatesTokenCount ?? null,
     };

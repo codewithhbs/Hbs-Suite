@@ -24,7 +24,9 @@ const PREFERRED = [
   "meta-llama/llama-4-scout-17b-16e-instruct",
   "llama-3.1-8b-instant",
 ];
-const NOT_CHAT = /whisper|guard|tts|playai|distil|orpheus|compound|prompt-guard/i;
+const NOT_CHAT = /whisper|guard|tts|playai|distil|orpheus|compound|prompt-guard|allam|saba|gemma|mistral-saba/i;
+/** reasoning models spend output tokens on hidden thinking - too small a budget = empty answer */
+const REASONING = /gpt-oss|qwen3|deepseek-r1|qwq/i;
 const CACHE_MS = 6 * 60 * 60 * 1000;
 let resolved = { key: "", model: null, at: 0 }; // model picked from /models for this API key
 
@@ -50,7 +52,9 @@ export async function listGroqModels(apiKey = process.env.GROQ_API_KEY) {
   const res = await fetch(`${BASE()}/models`, { headers: { Authorization: `Bearer ${apiKey}` }, signal: AbortSignal.timeout(10000) });
   if (!res.ok) throw new Error(`Groq ${res.status}: ${(await res.text().catch(() => "")).slice(0, 200)}`);
   const ids = ((await res.json())?.data || []).filter((m) => m.active !== false).map((m) => m.id).filter((id) => !NOT_CHAT.test(id));
-  const ranked = [...PREFERRED.filter((id) => ids.includes(id)), ...ids.filter((id) => !PREFERRED.includes(id))];
+  const good = PREFERRED.filter((id) => ids.includes(id));
+  // unknown models only when none of the tested ones is on this key
+  const ranked = good.length ? good : ids;
   modelsCache = { key: apiKey, list: ranked, at: Date.now() };
   return ranked;
 }
@@ -120,6 +124,14 @@ export class GroqProvider {
       temperature,
       ...(json ? { response_format: { type: "json_object" } } : {}),
     };
+    /** per-model body: reasoning models get a bigger budget and low reasoning so the answer is not empty */
+    const bodyFor = (m) => {
+      if (!REASONING.test(m)) return body;
+      const b = { ...body, max_completion_tokens: Math.max(Number(maxTokens) * 3, 4096) };
+      if (/gpt-oss/i.test(m)) b.reasoning_effort = "low";
+      if (/qwen3/i.test(m)) b.reasoning_format = "hidden";
+      return b;
+    };
 
     let model = this.textModel;
     let r = null;
@@ -127,14 +139,14 @@ export class GroqProvider {
       // main model is rate limited right now -> start on the next free model
       model = (await this.#nextFreeModel([model])) || model;
     } else {
-      r = await this.#chat(model, body);
+      r = await this.#chat(model, bodyFor(model));
     }
     if (r && !r.ok && isModelGone(r.status, r.txt)) {
       model = await this.#pickAvailableModel(model);
       this.textModel = model;
-      r = await this.#chat(model, body);
+      r = await this.#chat(model, bodyFor(model));
     }
-    if (!r) r = await this.#chat(model, body);
+    if (!r) r = await this.#chat(model, bodyFor(model));
 
     // 429 = this model's rate limit / daily tokens are used up. Every Groq model has
     // its own limit, so try the next good model before giving up on Groq.
@@ -146,12 +158,12 @@ export class GroqProvider {
       console.warn(`[groq] ${model} rate limited - trying ${next}`);
       model = next;
       tried.push(model);
-      r = await this.#chat(model, body);
+      r = await this.#chat(model, bodyFor(model));
     }
 
     if (!r.ok && r.status === 400 && json && /json_validate_failed|response_format/i.test(r.txt)) {
       // model rejected JSON mode -> ask for JSON in the prompt only
-      const { response_format: _rf, ...plain } = body;
+      const { response_format: _rf, ...plain } = bodyFor(model);
       r = await this.#chat(model, plain);
     }
     if (!r.ok) {
@@ -160,9 +172,21 @@ export class GroqProvider {
       throw new Error(`Groq ${r.status}${r.status === 429 ? " (rate limit / quota)" : ""}: ${r.txt}`);
     }
 
-    const data = r.data;
-    const text = data?.choices?.[0]?.message?.content ?? "";
-    if (!text) throw new Error("Groq returned an empty response");
+    let data = r.data;
+    let text = data?.choices?.[0]?.message?.content ?? "";
+    if (!text) {
+      // a reasoning model used its whole budget on thinking -> one try on the next good model
+      const next = await this.#nextFreeModel([model]);
+      if (next) {
+        const r2 = await this.#chat(next, bodyFor(next));
+        if (r2.ok && r2.data?.choices?.[0]?.message?.content) {
+          model = next;
+          data = r2.data;
+          text = data.choices[0].message.content;
+        }
+      }
+    }
+    if (!text) throw new Error(`Groq returned an empty response (${model}, finish: ${data?.choices?.[0]?.finish_reason || "unknown"})`);
     return {
       text,
       model: data?.model || model,

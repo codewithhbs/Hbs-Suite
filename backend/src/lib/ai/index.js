@@ -85,6 +85,7 @@ function preferFirst(chain, name) {
 }
 
 /** Quota / balance / rate-limit errors: retrying the same provider is pointless -> next provider now. */
+const FATAL_RE = /^(400|401|403|404)\b|no longer available|not found for API version|API key not valid|PERMISSION_DENIED|GEMINI_API_KEY not configured|GROQ_API_KEY not configured/i;
 const QUOTA_RE = /\b429\b|RESOURCE_EXHAUSTED|quota|rate.?limit|insufficient|billing|credit balance|exceeded|payment required|\b402\b/i;
 
 /** True when a real (non-template) AI provider is set up. */
@@ -412,6 +413,8 @@ export async function runAI({
         if (provider.noRetry && /falling back/.test(String(err?.message))) break;
         // Gemini / Groq balance or quota finished: don't retry, go to the next provider now
         if (QUOTA_RE.test(String(err?.message || ""))) break;
+        // wrong key / retired model / bad request: the same call fails again -> next provider now
+        if (FATAL_RE.test(String(err?.message || ""))) break;
 
         if (attempt <= maxRetries) {
           const delay = 500 * attempt;

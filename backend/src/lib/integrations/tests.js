@@ -24,18 +24,28 @@ export async function runIntegrationTest(id, v) {
     }
     case "gemini": {
       // listing models does not prove the key can generate (disabled service account / billing) -> tiny real call
-      const model = String(v.text_model || "gemini-2.5-flash").trim();
-      const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(v.api_key)}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ contents: [{ parts: [{ text: "Reply with OK" }] }], generationConfig: { maxOutputTokens: 5 } }),
-        signal: AbortSignal.timeout(15000),
-      });
-      if (!res.ok) {
-        const msg = (await res.json().catch(() => ({})))?.error?.message || `HTTP ${res.status}`;
-        throw new Error(/service account/i.test(msg) ? `${msg} -> create a NEW key at aistudio.google.com/apikey and paste it here.` : msg);
+      const call = async (model) => {
+        const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-goog-api-key": v.api_key },
+          body: JSON.stringify({ contents: [{ parts: [{ text: "Reply with OK" }] }], generationConfig: { maxOutputTokens: 64 } }),
+          signal: AbortSignal.timeout(20000),
+        });
+        if (res.ok) return null;
+        return (await res.json().catch(() => ({})))?.error?.message || `HTTP ${res.status}`;
+      };
+      const want = String(v.text_model || "").trim() || "gemini-flash-latest";
+      const err = await call(want);
+      if (!err) return `API key valid (${want} answered)`;
+      if (/service account/i.test(err)) throw new Error(`${err} -> create a NEW key at aistudio.google.com/apikey and paste it here.`);
+      if (/no longer available|not found|not supported|does not exist|deprecated/i.test(err)) {
+        const { listGeminiTextModels } = await import("../ai/providers/gemini.js");
+        const list = (await listGeminiTextModels(v.api_key)).filter((m) => m !== want);
+        for (const m of list.slice(0, 3)) {
+          if (!(await call(m))) return `Key valid. Model "${want}" is retired for this key - "${m}" will be used automatically (or set Text model = ${m}). Available: ${list.slice(0, 5).join(", ")}`;
+        }
       }
-      return `API key valid (${model} answered)`;
+      throw new Error(err);
     }
     case "openai":
       await get("https://api.openai.com/v1/models", { headers: { Authorization: `Bearer ${v.api_key}` } });

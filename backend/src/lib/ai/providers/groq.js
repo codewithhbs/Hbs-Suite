@@ -28,14 +28,30 @@ const NOT_CHAT = /whisper|guard|tts|playai|distil|orpheus|compound|prompt-guard/
 const CACHE_MS = 6 * 60 * 60 * 1000;
 let resolved = { key: "", model: null, at: 0 }; // model picked from /models for this API key
 
+/** model -> time until it may be used again (each Groq model has its own rate limit) */
+const cooling = new Map();
+const COOL_DEFAULT_MS = 60 * 1000;
+const isCooling = (m) => (cooling.get(m) || 0) > Date.now();
+/** "Please try again in 7m12.5s" / "in 45.2s" / "in 850ms" -> ms (max 1h) */
+function retryAfterMs(txt) {
+  const m = /try again in\s+(?:(\d+)h)?(?:(\d+)m(?!s))?(?:([\d.]+)s)?(?:([\d.]+)ms)?/i.exec(String(txt || ""));
+  if (!m) return COOL_DEFAULT_MS;
+  const ms = (Number(m[1] || 0) * 3600 + Number(m[2] || 0) * 60 + Number(m[3] || 0)) * 1000 + Number(m[4] || 0);
+  return Math.min(Math.max(ms || COOL_DEFAULT_MS, 5000), 60 * 60 * 1000);
+}
+const MAX_SWITCHES = Number(process.env.GROQ_MAX_MODEL_SWITCHES || 3);
+
 const isModelGone = (status, txt) => status === 404 || /model_not_found|decommissioned|does not exist|no longer supported/i.test(txt);
 
 /** Live model list for this key, best usable chat model first. */
+let modelsCache = { key: "", list: null, at: 0 };
 export async function listGroqModels(apiKey = process.env.GROQ_API_KEY) {
+  if (modelsCache.key === apiKey && modelsCache.list && Date.now() - modelsCache.at < 10 * 60 * 1000) return modelsCache.list;
   const res = await fetch(`${BASE()}/models`, { headers: { Authorization: `Bearer ${apiKey}` }, signal: AbortSignal.timeout(10000) });
   if (!res.ok) throw new Error(`Groq ${res.status}: ${(await res.text().catch(() => "")).slice(0, 200)}`);
   const ids = ((await res.json())?.data || []).filter((m) => m.active !== false).map((m) => m.id).filter((id) => !NOT_CHAT.test(id));
   const ranked = [...PREFERRED.filter((id) => ids.includes(id)), ...ids.filter((id) => !PREFERRED.includes(id))];
+  modelsCache = { key: apiKey, list: ranked, at: Date.now() };
   return ranked;
 }
 
@@ -63,6 +79,17 @@ export class GroqProvider {
     resolved = { key: this.apiKey, model: list[0], at: Date.now() };
     console.warn(`[groq] model "${exclude}" is not available - using "${list[0]}" (set GROQ_TEXT_MODEL to change)`);
     return list[0];
+  }
+
+  /** Best model for this key that is not rate limited and not in `skip`. */
+  async #nextFreeModel(skip = []) {
+    let list;
+    try {
+      list = await listGroqModels(this.apiKey);
+    } catch {
+      list = PREFERRED;
+    }
+    return list.find((m) => !skip.includes(m) && !isCooling(m)) || null;
   }
 
   async #chat(model, body) {
@@ -95,18 +122,40 @@ export class GroqProvider {
     };
 
     let model = this.textModel;
-    let r = await this.#chat(model, body);
-    if (!r.ok && isModelGone(r.status, r.txt)) {
+    let r = null;
+    if (isCooling(model)) {
+      // main model is rate limited right now -> start on the next free model
+      model = (await this.#nextFreeModel([model])) || model;
+    } else {
+      r = await this.#chat(model, body);
+    }
+    if (r && !r.ok && isModelGone(r.status, r.txt)) {
       model = await this.#pickAvailableModel(model);
       this.textModel = model;
       r = await this.#chat(model, body);
     }
+    if (!r) r = await this.#chat(model, body);
+
+    // 429 = this model's rate limit / daily tokens are used up. Every Groq model has
+    // its own limit, so try the next good model before giving up on Groq.
+    const tried = [model];
+    while (!r.ok && r.status === 429 && tried.length <= MAX_SWITCHES) {
+      cooling.set(model, Date.now() + retryAfterMs(r.txt));
+      const next = await this.#nextFreeModel(tried);
+      if (!next) break;
+      console.warn(`[groq] ${model} rate limited - trying ${next}`);
+      model = next;
+      tried.push(model);
+      r = await this.#chat(model, body);
+    }
+
     if (!r.ok && r.status === 400 && json && /json_validate_failed|response_format/i.test(r.txt)) {
       // model rejected JSON mode -> ask for JSON in the prompt only
       const { response_format: _rf, ...plain } = body;
       r = await this.#chat(model, plain);
     }
     if (!r.ok) {
+      if (r.status === 429) cooling.set(model, Date.now() + retryAfterMs(r.txt));
       // 429 = rate limit / daily token quota -> runAI moves to the next provider at once
       throw new Error(`Groq ${r.status}${r.status === 429 ? " (rate limit / quota)" : ""}: ${r.txt}`);
     }

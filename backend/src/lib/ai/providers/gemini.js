@@ -56,11 +56,27 @@ function repairJson(text) {
   return tryParse(noTrailingCommas) ? noTrailingCommas : null;
 }
 
+/** Models that cannot write text (image / embedding / audio / video). */
+const NOT_TEXT = /image|imagen|embedding|embed|tts|veo|aqa|live|native-audio/i;
+const SAFE_TEXT_MODEL = "gemini-2.5-flash";
+const NO_JSON_MODE = /JSON mode is not enabled|response_mime_type|responseMimeType|response mime type/i;
+const NO_SYSTEM = /Developer instruction is not enabled|system_instruction|systemInstruction/i;
+/** models found (at runtime) not to support JSON mode / system instructions */
+const noJsonModels = new Set();
+const noSystemModels = new Set();
+let warnedModel = "";
+
 export class GeminiProvider {
   constructor() {
     this.name = "gemini";
     this.apiKey = process.env.GEMINI_API_KEY || "";
-    this.textModel = process.env.GEMINI_TEXT_MODEL || "gemini-2.5-flash";
+    const configured = (process.env.GEMINI_TEXT_MODEL || "").trim() || SAFE_TEXT_MODEL;
+    // an image / embedding model in the TEXT model field -> 400 errors on every post; use a text model instead
+    this.textModel = NOT_TEXT.test(configured) ? SAFE_TEXT_MODEL : configured;
+    if (this.textModel !== configured && warnedModel !== configured) {
+      warnedModel = configured;
+      console.warn(`[gemini] GEMINI_TEXT_MODEL "${configured}" cannot write text - using "${SAFE_TEXT_MODEL}". Fix it in Admin -> Integrations -> Google Gemini -> Text model.`);
+    }
     this.embeddingModel =
       process.env.GEMINI_EMBEDDING_MODEL || "text-embedding-004";
     this.imageModel =
@@ -112,12 +128,12 @@ export class GeminiProvider {
     if (!this.isConfigured()) throw new Error("GEMINI_API_KEY not configured");
     if (!prompt) throw new Error("Prompt is required");
 
-    const generationConfig = {
+    const model = this.textModel;
+    const buildConfig = (jsonMode) => ({
       // Thinking models spend output budget on thoughts, so never go below 1024.
       maxOutputTokens: Math.max(Number(maxTokens) || 1024, 1024),
       temperature,
-
-      ...(json
+      ...(jsonMode
         ? {
             responseMimeType: "application/json",
             // A schema is applied ONLY when the calling agent passes one.
@@ -125,27 +141,48 @@ export class GeminiProvider {
             ...(schema ? { responseSchema: schema } : {}),
           }
         : {}),
-
       // Gemini 3 models use thinkingLevel. LOW is enough for writing tasks.
-      ...(String(this.textModel).startsWith("gemini-3")
-        ? { thinkingConfig: { thinkingLevel: "LOW" } }
-        : {}),
+      ...(String(model).startsWith("gemini-3") ? { thinkingConfig: { thinkingLevel: "LOW" } } : {}),
+    });
+
+    /**
+     * Some models (Gemma, older / preview models) reject JSON mode or a system
+     * instruction with a 400. Then the same request is sent again without it:
+     * JSON is asked for in the prompt and the system text is put in front of the prompt.
+     */
+    const send = (jsonMode, systemField) => {
+      const jsonHint = json && !jsonMode ? "\n\nRespond with valid JSON only - no markdown, no text outside the JSON." : "";
+      const text = `${!systemField && system ? `${system}\n\n` : ""}${prompt}${jsonHint}`;
+      debug("[GEMINI] Request", { model, maxTokens, temperature, json, jsonMode, systemField, hasSchema: Boolean(schema) });
+      return this.#post(`/models/${model}:generateContent`, {
+        ...(systemField && system ? { systemInstruction: { parts: [{ text: system }] } } : {}),
+        contents: [{ role: "user", parts: [{ text }] }],
+        generationConfig: buildConfig(jsonMode),
+      });
     };
 
-    debug("[GEMINI] Request", {
-      model: this.textModel,
-      maxTokens,
-      effectiveMaxOutputTokens: generationConfig.maxOutputTokens,
-      temperature,
-      json,
-      hasSchema: Boolean(schema),
-    });
-
-    const data = await this.#post(`/models/${this.textModel}:generateContent`, {
-      ...(system ? { systemInstruction: { parts: [{ text: system }] } } : {}),
-      contents: [{ role: "user", parts: [{ text: prompt }] }],
-      generationConfig,
-    });
+    let jsonMode = json && !noJsonModels.has(model);
+    let systemField = !noSystemModels.has(model);
+    let data;
+    for (let attempt = 0; ; attempt++) {
+      try {
+        data = await send(jsonMode, systemField);
+        break;
+      } catch (err) {
+        const msg = String(err.message || "");
+        if (attempt < 2 && msg.startsWith("400") && jsonMode && NO_JSON_MODE.test(msg)) {
+          noJsonModels.add(model);
+          jsonMode = false;
+          continue;
+        }
+        if (attempt < 2 && msg.startsWith("400") && systemField && NO_SYSTEM.test(msg)) {
+          noSystemModels.add(model);
+          systemField = false;
+          continue;
+        }
+        throw err;
+      }
+    }
 
     // Prompt blocked before any candidate was produced.
     if (data?.promptFeedback?.blockReason) {
@@ -167,7 +204,7 @@ export class GeminiProvider {
       .trim();
 
     debug("[GEMINI] Response", {
-      model: this.textModel,
+      model,
       finishReason,
       finishMessage: candidate?.finishMessage || null,
       promptTokens: data?.usageMetadata?.promptTokenCount ?? null,

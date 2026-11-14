@@ -88,7 +88,7 @@ export async function createClient(payload, tenantId) {
     posting_frequency: payload.posting_frequency || "WEEKLY",
     gmb_location_id: payload.gmb_location_id || null,
     gmb_connection_status: "MOCK_CONNECTED",
-    assigned_employee_id: payload.assigned_employee_id || null,
+    assigned_employee_id: await cleanEmployeeId(payload.assigned_employee_id, tenantId),
     approved_claims: payload.approved_claims || [],
     prohibited_claims: payload.prohibited_claims || [],
   });
@@ -127,6 +127,17 @@ export async function createClient(payload, tenantId) {
   return clientId;
 }
 
+/**
+ * "" / 0 / "null" / an employee of another tenant / a deleted employee -> null.
+ * The form sends "" for "Unassigned"; MySQL turns "" into 0 and the FK to employees fails.
+ */
+async function cleanEmployeeId(value, tenantId) {
+  const n = Number(value);
+  if (!value || !Number.isInteger(n) || n <= 0) return null;
+  const e = await one(`SELECT id FROM employees WHERE id=?${tenantId ? " AND tenant_id=?" : ""}`, tenantId ? [n, tenantId] : [n]);
+  return e ? e.id : null;
+}
+
 export async function updateClient(id, payload, tenantId = null) {
   await assertClientInTenant(id, tenantId);
   const fields = [
@@ -136,6 +147,7 @@ export async function updateClient(id, payload, tenantId = null) {
   ];
   const patch = {};
   for (const f of fields) if (payload[f] !== undefined) patch[f] = payload[f];
+  if (patch.assigned_employee_id !== undefined) patch.assigned_employee_id = await cleanEmployeeId(patch.assigned_employee_id, tenantId);
   if (payload.approved_claims !== undefined) patch.approved_claims = splitList(payload.approved_claims);
   if (payload.prohibited_claims !== undefined) patch.prohibited_claims = splitList(payload.prohibited_claims);
   if (Object.keys(patch).length) await update("clients", id, patch);

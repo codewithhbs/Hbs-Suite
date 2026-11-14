@@ -1,3 +1,4 @@
+import { localISO } from "@/lib/utils";
 import { useMemo, useState } from "react";
 import { CalendarPlus, Check, Copy, Loader2, Lock, Plus, RefreshCw, Search, Trash2, X } from "lucide-react";
 import { Input, Skeleton } from "@/components/ui";
@@ -95,7 +96,7 @@ export function HoursEditor({ hours, setHours }) {
 
 /* ---------------- special / holiday hours ---------------- */
 export function SpecialHoursEditor({ rows, setRows }) {
-  const today = new Date().toISOString().slice(0, 10);
+  const today = localISO();
   const update = (i, patch) => setRows((r) => r.map((x, j) => (j === i ? { ...x, ...patch } : x)));
   return (
     <div className="space-y-2">

@@ -1,3 +1,4 @@
+import { localISO } from "@/lib/utils";
 import { useRouter } from "next/navigation";
 import { LogOut, Play, Menu } from "lucide-react";
 import { useState } from "react";
@@ -23,7 +24,7 @@ export function Topbar({ session, aiProvider, gmbProvider, onMenuClick, creditsL
       const res = await fetch("/api/ai/nightly", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ date: new Date().toISOString().slice(0, 10), engine }),
+        body: JSON.stringify({ date: localISO(), engine }),
       });
       const data = await res.json();
       setMsg(

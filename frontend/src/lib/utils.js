@@ -14,10 +14,15 @@ export function formatDate(d, withTime = false) {
   return date.toLocaleString("en-IN", opts);
 }
 
+/** YYYY-MM-DD in the browser's LOCAL time. toISOString() is UTC: in India it gives the previous day for local midnight. */
+export function localISO(d = new Date()) {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
 export function todayISO(offsetDays = 0) {
   const d = new Date();
   d.setDate(d.getDate() + offsetDays);
-  return d.toISOString().slice(0, 10);
+  return localISO(d);
 }
 
 export function pct(n, total) {

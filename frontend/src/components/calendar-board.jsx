@@ -8,6 +8,7 @@ import { POST_TYPES } from "@/lib/constants";
 import { usePlanUsage, PlanUsageInline } from "@/components/posting/plan-usage";
 import { useEngineChoice } from "@/components/engine-choice";
 import { AiComboSelect, aiLabel } from "@/components/ai-picker";
+import { localISO } from "@/lib/utils";
 
 const TYPE_COLORS = [
   { bg: "bg-blue-50 dark:bg-blue-950/40", text: "text-blue-700 dark:text-blue-300", ring: "ring-blue-200 dark:ring-blue-900" },
@@ -24,7 +25,8 @@ function colorFor(type) {
   for (let i = 0; i < type.length; i++) h = (h * 31 + type.charCodeAt(i)) >>> 0;
   return TYPE_COLORS[h % TYPE_COLORS.length];
 }
-function toISO(d) { return d.toISOString().slice(0, 10); }
+// LOCAL date - toISOString() is UTC and moved every cell one day back in India (+05:30)
+function toISO(d) { return localISO(d); }
 function monthKey(d) { return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`; }
 function fmtMonth(d) { return d.toLocaleDateString("en-US", { month: "long", year: "numeric" }); }
 
